@@ -1,0 +1,116 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "punkreq"
+version = "0.1.0"
+description = "An async HTTP client built on httpunk"
+readme = "README.md"
+license = "BSD-3-Clause"
+requires-python = ">=3.10"
+
+authors = [
+    { name = "Giovanni Barillari", email = "g@baro.dev" }
+]
+
+keywords = ["async", "http", "client", "httpunk"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: BSD License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: Free Threading :: 3 - Stable",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Internet :: WWW/HTTP",
+]
+
+dependencies = [
+    "httpunk~=0.1.0",
+]
+
+[project.optional-dependencies]
+brotli = ["brotli~=1.2.0"]
+tonio = ["tonio~=0.8.1; python_version >= '3.14'"]
+
+[dependency-groups]
+lint = [
+    "ruff~=0.11"
+]
+test = [
+    "pytest>=7.4",
+    "trustme>=1.2.1",
+]
+
+[project.urls]
+Homepage = 'https://github.com/gi0baro/punkreq'
+Funding = 'https://github.com/sponsors/gi0baro'
+Source = 'https://github.com/gi0baro/punkreq'
+Issues = 'https://github.com/gi0baro/punkreq/issues'
+
+[tool.hatch.build.targets.sdist]
+include = [
+    '/README.md',
+    '/LICENSE',
+    '/punkreq',
+    '/tests',
+]
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.format]
+quote-style = 'double'
+
+[tool.ruff.lint]
+extend-select = [
+    # E and F are enabled by default
+    'B',      # flake8-bugbear
+    'C4',     # flake8-comprehensions
+    'C90',    # mccabe
+    'I',      # isort
+    'N',      # pep8-naming
+    'Q',      # flake8-quotes
+    'RUF100', # ruff (unused noqa)
+    'S',      # flake8-bandit
+    'W',      # pycodestyle
+]
+extend-ignore = [
+    'B006', # mutable function args are fine
+    'B008', # function calls in args defaults are fine
+    'B009', # getattr with constants is fine
+    'B034', # re.split won't confuse us
+    'B904', # rising without from is fine
+    'E731', # assigning lambdas is fine
+    'F403', # import * is fine
+    'N801', # leave to us class naming
+    'N802', # leave to us method naming
+    'N806', # leave to us var naming
+    'N811', # leave to us var naming
+    'N814', # leave to us var naming
+    'N818', # leave to us exceptions naming
+    'S101', # assert is fine
+    'S102', # exec is fine
+    'S104', # leave to us security
+    'S105', # leave to us security
+    'S106', # leave to us security
+    'S107', # leave to us security
+    'S110', # pass on exceptions is fine
+    'S301', # leave to us security
+    'S307', # leave to us security
+    'S324', # leave to us security
+]
+mccabe = { max-complexity = 44 }
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+lines-after-imports = 2
+known-first-party = ['punkreq', 'tests']
+
+[tool.ruff.lint.per-file-ignores]
+'tonio_monkey/__init__.py' = ['F401']
+'tests/**' = ['B017', 'B018', 'E711', 'E712', 'E741', 'F841', 'N803', 'S110', 'S501']

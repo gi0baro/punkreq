@@ -1,0 +1,249 @@
+from __future__ import annotations
+
+import functools
+import typing
+
+import httpunk
+from httpunk import GoAwayError, H2Reason, StreamResetError
+from httpunk.exceptions import ConnectionClosedError, H2Error, H2UserError, HTTPunkError
+
+from ._config import Timeout
+from ._connect import origin_for_url
+from ._content import AsyncByteStream, ByteStream
+from ._exceptions import (
+    HTTPError,
+    LocalProtocolError,
+    ReadError,
+    ReadTimeout,
+    RemoteProtocolError,
+    RequestError,
+    TimeoutException,
+)
+from ._headers import Headers
+from ._models import Request, Response
+from ._pool import ConnectionPool, _is_multiplexed
+from ._proxies import PROXY_ATTR, ProxyInfo
+
+
+__all__ = ["PoolTransport"]
+
+_MAX_NACK_RETRIES = 2
+
+
+def map_httpunk_exception(exc: BaseException, request: Request) -> BaseException:
+    """Translate an httpunk (or OS-level) failure into the punkreq hierarchy."""
+    if isinstance(exc, HTTPError):
+        if isinstance(exc, RequestError) and exc._request is None:
+            exc.request = request
+        return exc
+    message = str(exc) or type(exc).__name__
+    mapped: HTTPError
+    if isinstance(exc, (H2UserError, ValueError)):
+        mapped = LocalProtocolError(message)
+    elif isinstance(exc, ConnectionClosedError):
+        mapped = RemoteProtocolError(f"Server disconnected: {message}")
+    elif isinstance(exc, (H2Error, HTTPunkError)):
+        mapped = RemoteProtocolError(message)
+    elif isinstance(exc, OSError):
+        mapped = ReadError(message)
+    else:
+        return exc
+    mapped.request = request
+    return mapped
+
+
+def _is_retryable_nack(exc: BaseException, reused: bool) -> bool:
+    """reqwest's conservative retry policy: only failures where the server
+    demonstrably never processed the request."""
+    if isinstance(exc, GoAwayError):
+        return exc.error_code == H2Reason.NO_ERROR
+    if isinstance(exc, StreamResetError):
+        return exc.error_code == H2Reason.REFUSED_STREAM
+    if isinstance(exc, ConnectionClosedError):
+        # h1 keep-alive race: the server closed an idle connection while we
+        # reused it. Only safe when the connection had served traffic before.
+        return reused
+    return False
+
+
+def _to_httpunk_request(request: Request, *, h2: bool, proxy: ProxyInfo | None = None) -> httpunk.Request:
+    headers = request.headers._map
+    needs_copy = proxy is not None or (h2 and ("host" in headers or "transfer-encoding" in headers))
+    if needs_copy:
+        headers = httpunk.HeaderMap(headers)
+    if h2:
+        for name in ("host", "transfer-encoding"):
+            if name in headers:
+                del headers[name]
+
+    target = request.url.raw_path
+    if proxy is not None:
+        # plain-http proxying: absolute-form target + per-request proxy headers
+        target = f"{request.url.scheme}://{request.url.netloc}{request.url.raw_path}"
+        if proxy.auth is not None:
+            headers.setdefault("proxy-authorization", proxy.auth)
+        for key, value in proxy.headers.raw:
+            headers.setdefault(key, value)
+
+    body: typing.Any
+    if isinstance(request.stream, ByteStream):
+        body = request.stream.data or None
+    else:
+        body = request.stream
+
+    return httpunk.Request(request.method, target, headers=headers, body=body)
+
+
+class _PooledStream(AsyncByteStream):
+    """Adapts an httpunk response body to `AsyncByteStream`, bounding each read
+    with the `read` timeout and releasing the connection exactly once — on
+    natural end, on error, or on early close. httpunk's `Response.aclose()` is
+    a no-op after a full read and closes/resets the connection otherwise, so
+    the pool's `.closed` check does the right thing in every case."""
+
+    def __init__(
+        self,
+        httpunk_response: typing.Any,
+        request: Request,
+        *,
+        backend: typing.Any,
+        read_timeout: float | None,
+        deadline: float | None,
+        release: typing.Callable[[], typing.Awaitable[None]] | None,
+    ) -> None:
+        self._response = httpunk_response
+        self._request = request
+        self._backend = backend
+        self._read_timeout = read_timeout
+        self._deadline = deadline
+        self._release = release
+        self._finalized = False
+        self._on_finish: list[typing.Callable[[], typing.Any]] = []
+
+    @property
+    def closed(self) -> bool:
+        return self._finalized
+
+    def add_finish_callback(self, callback: typing.Callable[[], typing.Any]) -> None:
+        """Register a callback fired exactly once when the stream finalizes
+        (natural end, error, or close). May return an awaitable."""
+        self._on_finish.append(callback)
+
+    def __aiter__(self) -> typing.AsyncIterator[bytes]:
+        return self._iterate()
+
+    async def _iterate(self) -> typing.AsyncIterator[bytes]:
+        iterator = self._response.aiter_bytes()
+        while True:
+            try:
+                effective = self._read_timeout
+                if self._deadline is not None:
+                    remaining = self._deadline - self._backend.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutException("Exceeded the total request timeout", request=self._request)
+                    effective = remaining if effective is None else min(effective, remaining)
+                if effective is None:
+                    chunk = await iterator.__anext__()
+                else:
+                    result, completed = await self._backend.timeout(iterator.__anext__(), effective)
+                    if not completed:
+                        raise ReadTimeout("Timed out reading the response body", request=self._request)
+                    chunk = result
+            except StopAsyncIteration:
+                break
+            except BaseException as exc:
+                await self.close()
+                raise map_httpunk_exception(exc, self._request)
+            yield chunk
+        await self.close()
+
+    async def close(self) -> None:
+        if self._finalized:
+            return
+        self._finalized = True
+        try:
+            await self._response.aclose()
+        finally:
+            if self._release is not None:
+                await self._release()
+            for callback in self._on_finish:
+                result = callback()
+                if result is not None and hasattr(result, "__await__"):
+                    await result
+
+
+class PoolTransport:
+    """Sends single requests over a `ConnectionPool` (no redirects, cookies or
+    auth — those live in the client pipeline above)."""
+
+    def __init__(self, pool: ConnectionPool, *, backend: typing.Any) -> None:
+        self._pool = pool
+        self._backend = backend
+
+    async def send(self, request: Request) -> Response:
+        origin = origin_for_url(request.url)
+        raw_timeout = request.extensions.get("timeout")
+        timeout = Timeout(raw_timeout) if raw_timeout is not None else Timeout(None)
+        # the total-timeout deadline; the client stashes it in extensions so it
+        # spans redirect hops, else it covers this exchange only
+        deadline = request.extensions.get("deadline")
+        if deadline is None and timeout.total is not None:
+            deadline = self._backend.monotonic() + timeout.total
+        replayable = isinstance(request.stream, ByteStream)
+        attempts = 0
+
+        while True:
+            conn, exclusive, reused = await self._pool.acquire(
+                origin,
+                connect_timeout=self._effective(timeout.connect, deadline, request),
+                pool_timeout=self._effective(timeout.pool, deadline, request),
+            )
+            try:
+                httpunk_response = await self._send_on(conn, request, self._effective(timeout.read, deadline, request))
+            except BaseException as exc:
+                if exclusive:
+                    # the connection is mid-exchange and unusable: force-close so
+                    # release drops it instead of pooling a corrupt connection
+                    await self._pool._close_conn(conn)
+                    await self._pool.release(origin, conn)
+                if _is_retryable_nack(exc, reused) and replayable and attempts < _MAX_NACK_RETRIES:
+                    attempts += 1
+                    continue
+                raise map_httpunk_exception(exc, request)
+
+            release = functools.partial(self._pool.release, origin, conn) if exclusive else None
+            stream = _PooledStream(
+                httpunk_response,
+                request,
+                backend=self._backend,
+                read_timeout=timeout.read,
+                deadline=deadline,
+                release=release,
+            )
+            return Response(
+                httpunk_response.status,
+                headers=Headers(httpunk_response.headers),
+                stream=stream,
+                request=request,
+                extensions={"http_version": "HTTP/2" if _is_multiplexed(conn) else "HTTP/1.1"},
+            )
+
+    def _effective(self, phase: float | None, deadline: float | None, request: Request) -> float | None:
+        """The timeout for one operation: the phase timeout bounded by whatever
+        remains of the total deadline. Raises once the deadline has passed."""
+        if deadline is None:
+            return phase
+        remaining = deadline - self._backend.monotonic()
+        if remaining <= 0:
+            raise TimeoutException("Exceeded the total request timeout", request=request)
+        return remaining if phase is None else min(phase, remaining)
+
+    async def _send_on(self, conn: typing.Any, request: Request, read_timeout: float | None) -> typing.Any:
+        proxy_info = getattr(conn, PROXY_ATTR, None)
+        httpunk_request = _to_httpunk_request(request, h2=_is_multiplexed(conn), proxy=proxy_info)
+        if read_timeout is None:
+            return await conn.send_request(httpunk_request)
+        result, completed = await self._backend.timeout(conn.send_request(httpunk_request), read_timeout)
+        if not completed:
+            raise ReadTimeout("Timed out waiting for the response", request=request)
+        return result
