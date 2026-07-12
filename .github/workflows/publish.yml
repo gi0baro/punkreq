@@ -1,0 +1,27 @@
+name: Publish
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/punkreq
+    permissions:
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: false
+      - name: Build distributions
+        run: |
+          uv build
+      - name: Publish package to pypi
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
