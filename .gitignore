@@ -1,0 +1,13 @@
+*.DS_Store
+__pycache__
+
+*.sublime-*
+.venv
+.vscode
+
+.pytest_cache
+.ruff_cache
+
+build/*
+dist/*
+uv.lock
