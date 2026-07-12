@@ -36,7 +36,9 @@ class Cookies(typing.MutableMapping[str, str]):
                 self.set(key, value)
         elif isinstance(cookies, Cookies):
             self.jar = CookieJar()
-            for cookie in cookies.jar:
+            with cookies.jar._cookies_lock:
+                snapshot = list(cookies.jar)
+            for cookie in snapshot:
                 self.jar.set_cookie(cookie)
         elif isinstance(cookies, CookieJar):
             self.jar = cookies
@@ -88,30 +90,34 @@ class Cookies(typing.MutableMapping[str, str]):
         """The value for a cookie by name, with optional domain/path narrowing.
         Raises `CookieConflict` when multiple cookies match ambiguously."""
         value = None
-        for cookie in self.jar:
-            if cookie.name != name:
-                continue
-            if domain is not None and cookie.domain != domain:
-                continue
-            if path is not None and cookie.path != path:
-                continue
-            if value is not None:
-                raise CookieConflict(f"Multiple cookies exist with name {name!r}; use domain=/path= to disambiguate")
-            value = cookie.value
+        with self.jar._cookies_lock:
+            for cookie in self.jar:
+                if cookie.name != name:
+                    continue
+                if domain is not None and cookie.domain != domain:
+                    continue
+                if path is not None and cookie.path != path:
+                    continue
+                if value is not None:
+                    raise CookieConflict(
+                        f"Multiple cookies exist with name {name!r}; use domain=/path= to disambiguate"
+                    )
+                value = cookie.value
         return default if value is None else value
 
     def delete(self, name: str, domain: str | None = None, path: str | None = None) -> None:
-        if domain is not None and path is not None:
-            return self.jar.clear(domain, path, name)
-        remove = [
-            cookie
-            for cookie in self.jar
-            if cookie.name == name
-            and (domain is None or cookie.domain == domain)
-            and (path is None or cookie.path == path)
-        ]
-        for cookie in remove:
-            self.jar.clear(cookie.domain, cookie.path, cookie.name)
+        with self.jar._cookies_lock:
+            if domain is not None and path is not None:
+                return self.jar.clear(domain, path, name)
+            remove = [
+                cookie
+                for cookie in self.jar
+                if cookie.name == name
+                and (domain is None or cookie.domain == domain)
+                and (path is None or cookie.path == path)
+            ]
+            for cookie in remove:
+                self.jar.clear(cookie.domain, cookie.path, cookie.name)
 
     def clear(self, domain: str | None = None, path: str | None = None) -> None:  # type: ignore[override]
         args = []
@@ -120,10 +126,14 @@ class Cookies(typing.MutableMapping[str, str]):
         if path is not None:
             assert domain is not None
             args.append(path)
-        self.jar.clear(*args)
+        with self.jar._cookies_lock:
+            self.jar.clear(*args)
 
     def update(self, cookies: CookieTypes = None) -> None:  # type: ignore[override]
-        for cookie in Cookies(cookies).jar:
+        other = Cookies(cookies)
+        with other.jar._cookies_lock:  # `other.jar` is the caller's live jar when a CookieJar was passed
+            snapshot = list(other.jar)
+        for cookie in snapshot:
             self.jar.set_cookie(cookie)
 
     def __setitem__(self, name: str, value: str) -> None:
@@ -139,21 +149,27 @@ class Cookies(typing.MutableMapping[str, str]):
         self.delete(name)
 
     def __contains__(self, name: typing.Any) -> bool:
-        return any(cookie.name == name for cookie in self.jar)
+        with self.jar._cookies_lock:
+            return any(cookie.name == name for cookie in self.jar)
 
     def __iter__(self) -> typing.Iterator[str]:
-        return (cookie.name for cookie in self.jar)
+        with self.jar._cookies_lock:
+            names = [cookie.name for cookie in self.jar]
+        return iter(names)
 
     def __len__(self) -> int:
-        return len(self.jar)
+        with self.jar._cookies_lock:
+            return len(self.jar)
 
     def __bool__(self) -> bool:
-        for _ in self.jar:
-            return True
-        return False
+        with self.jar._cookies_lock:
+            for _ in self.jar:
+                return True
+            return False
 
     def __repr__(self) -> str:
-        cookies = [f"<Cookie {cookie.name}={cookie.value} for {cookie.domain}{cookie.path}>" for cookie in self.jar]
+        with self.jar._cookies_lock:
+            cookies = [f"<Cookie {cookie.name}={cookie.value} for {cookie.domain}{cookie.path}>" for cookie in self.jar]
         return f"<Cookies[{', '.join(cookies)}]>"
 
 

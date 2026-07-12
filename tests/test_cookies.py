@@ -1,3 +1,6 @@
+import threading
+import time
+
 import pytest
 
 import punkreq
@@ -76,3 +79,45 @@ class TestWireBehavior:
         same = Request("GET", "https://example.com/else")
         cookies.set_cookie_header(same)
         assert same.headers["cookie"] == "k=v"
+
+
+class TestThreadSafety:
+    def test_concurrent_mutation_and_read(self):
+        """Reads must not blow up while another thread mutates the jar — a real
+        parallelism test on free-threaded builds, a smoke test elsewhere."""
+        cookies = Cookies()
+        request = Request("GET", "https://example.com/")
+        stop = threading.Event()
+        errors: list[BaseException] = []
+
+        def writer():
+            i = 0
+            while not stop.is_set():
+                response = Response(200, headers={"set-cookie": f"k{i % 20}=v{i}; Path=/"}, request=request)
+                cookies.extract_cookies(response)
+                i += 1
+                if i % 50 == 0:
+                    cookies.clear()
+
+        def reader():
+            while not stop.is_set():
+                try:
+                    cookies.get("k0")
+                    len(cookies)
+                    _ = "k1" in cookies
+                    list(cookies)
+                    bool(cookies)
+                except punkreq.CookieConflict:
+                    pass
+                except BaseException as exc:  # noqa: B036 - the racing RuntimeError is the point
+                    errors.append(exc)
+                    stop.set()
+
+        threads = [threading.Thread(target=writer), threading.Thread(target=reader), threading.Thread(target=reader)]
+        for thread in threads:
+            thread.start()
+        time.sleep(0.3)
+        stop.set()
+        for thread in threads:
+            thread.join(timeout=5)
+        assert errors == []
