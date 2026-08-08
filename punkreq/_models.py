@@ -325,9 +325,13 @@ class Response:
             return
         decoder = self._get_content_decoder()
         chunker = ByteChunker(chunk_size)
-        async for raw in self.iter_raw():
-            for chunk in chunker.decode(decoder.decode(raw)):
-                yield chunk
+        inner = self.iter_raw()
+        try:
+            async for raw in inner:
+                for chunk in chunker.decode(decoder.decode(raw)):
+                    yield chunk
+        finally:
+            await inner.aclose()
         for chunk in chunker.decode(decoder.flush()):
             yield chunk
         for chunk in chunker.flush():
@@ -341,20 +345,26 @@ class Response:
             raise StreamClosed()
         self.is_stream_consumed = True
         chunker = ByteChunker(chunk_size)
-        async for raw in self.stream:
-            self._num_bytes_downloaded += len(raw)
-            for chunk in chunker.decode(raw):
+        try:
+            async for raw in self.stream:
+                self._num_bytes_downloaded += len(raw)
+                for chunk in chunker.decode(raw):
+                    yield chunk
+            for chunk in chunker.flush():
                 yield chunk
-        for chunk in chunker.flush():
-            yield chunk
-        await self.close()
+        finally:
+            await self.close()
 
     async def iter_text(self, chunk_size: int | None = None) -> typing.AsyncIterator[str]:
         decoder = TextDecoder(self.encoding)
         chunker = TextChunker(chunk_size)
-        async for content in self.iter_bytes():
-            for chunk in chunker.decode(decoder.decode(content)):
-                yield chunk
+        inner = self.iter_bytes()
+        try:
+            async for content in inner:
+                for chunk in chunker.decode(decoder.decode(content)):
+                    yield chunk
+        finally:
+            await inner.aclose()
         for chunk in chunker.decode(decoder.flush()):
             yield chunk
         for chunk in chunker.flush():
@@ -362,9 +372,13 @@ class Response:
 
     async def iter_lines(self) -> typing.AsyncIterator[str]:
         decoder = LineDecoder()
-        async for text in self.iter_text():
-            for line in decoder.decode(text):
-                yield line
+        inner = self.iter_text()
+        try:
+            async for text in inner:
+                for line in decoder.decode(text):
+                    yield line
+        finally:
+            await inner.aclose()
         for line in decoder.flush():
             yield line
 
