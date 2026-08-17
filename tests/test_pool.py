@@ -61,6 +61,23 @@ def make_pool(connector, **limits):
     return ConnectionPool(connector, backend=backend, limits=Limits(**limits))
 
 
+class SteppingBackend:
+    """Delegates to a real backend, but monotonic() strictly increases on every
+    call: on coarse OS clocks (Windows, ~16ms) consecutive releases can get
+    equal idle timestamps, making eviction order tie-dependent."""
+
+    def __init__(self, backend):
+        self._backend = backend
+        self._now = 0.0
+
+    def monotonic(self):
+        self._now += 1.0
+        return self._now
+
+    def __getattr__(self, name):
+        return getattr(self._backend, name)
+
+
 class TestH1:
     def test_acquire_is_exclusive_and_reused_after_release(self):
         connector = FakeConnector()
@@ -205,6 +222,105 @@ class TestH2:
 
         run(main())
         assert connector.dials == 2
+
+
+class TestHostPruning:
+    def test_keepalive_eviction_prunes_dead_hosts(self):
+        connector = FakeConnector()
+        origins = [Origin("http", f"origin-{i}.example", 80) for i in range(20)]
+
+        async def main():
+            pool = make_pool(connector, max_keepalive_connections=1)
+            for origin in origins:
+                conn, _, _ = await pool.acquire(origin)
+                await pool.release(origin, conn)
+            assert pool.idle_count == 1
+            assert len(pool._hosts) == 1  # only the origin holding the idle conn
+            await pool.close()
+            assert len(pool._hosts) == 0
+
+        run(main())
+
+    def test_dial_failure_prunes(self):
+        origins = [Origin("http", f"origin-{i}.example", 80) for i in range(10)]
+        connector = FakeConnector(fail=len(origins))
+
+        async def main():
+            pool = make_pool(connector)
+            for origin in origins:
+                with pytest.raises(punkreq.ConnectError):
+                    await pool.acquire(origin)
+            assert len(pool._hosts) == 0
+            assert pool.connection_count == 0
+            await pool.close()
+
+        run(main())
+
+    def test_connect_timeout_prunes(self):
+        connector = FakeConnector(delay=1.0)
+
+        async def main():
+            pool = make_pool(connector)
+            with pytest.raises(punkreq.ConnectTimeout):
+                await pool.acquire(ORIGIN, connect_timeout=0.02)
+            assert len(pool._hosts) == 0
+            await pool.close()
+
+        run(main())
+
+    def test_release_of_closed_connection_prunes(self):
+        connector = FakeConnector()
+
+        async def main():
+            pool = make_pool(connector)
+            conn, _, _ = await pool.acquire(ORIGIN)
+            conn.closed = True
+            await pool.release(ORIGIN, conn)
+            assert len(pool._hosts) == 0
+            await pool.close()
+
+        run(main())
+
+    def test_leased_host_survives_eviction(self):
+        connector = FakeConnector()
+
+        async def main():
+            backend = SteppingBackend(Backend.asyncio.create())
+            pool = ConnectionPool(connector, backend=backend, limits=Limits(max_keepalive_connections=1))
+            first, _, _ = await pool.acquire(ORIGIN)
+            second, _, _ = await pool.acquire(ORIGIN)
+            await pool.release(ORIGIN, first)
+            # OTHER_ORIGIN's release evicts ORIGIN's idle conn; the entry must
+            # survive because `second` is still checked out.
+            other, _, _ = await pool.acquire(OTHER_ORIGIN)
+            await pool.release(OTHER_ORIGIN, other)
+            assert first.closed
+            assert ORIGIN in pool._hosts
+            await pool.release(ORIGIN, second)
+            assert not second.closed  # parked, not dropped
+            again, _, reused = await pool.acquire(ORIGIN)
+            assert again is second
+            assert reused
+            await pool.release(ORIGIN, again)
+            await pool.close()
+
+        run(main())
+
+    def test_dead_shared_h2_and_failed_redial_prune(self):
+        connector = FakeConnector(multiplexed=True)
+
+        async def main():
+            pool = make_pool(connector)
+            conn, _, _ = await pool.acquire(ORIGIN)
+            conn.closed = True
+            connector.fail = 1
+            with pytest.raises(punkreq.ConnectError):
+                await pool.acquire(ORIGIN)
+            assert len(pool._hosts) == 0
+            assert pool.connection_count == 0
+            await pool.close()
+
+        run(main())
 
 
 class TestLimitsAndTimeouts:

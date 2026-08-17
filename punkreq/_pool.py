@@ -22,13 +22,14 @@ def _is_multiplexed(conn: typing.Any) -> bool:
 
 
 class _HostState:
-    __slots__ = ("mode", "shared", "idle", "dialing")
+    __slots__ = ("mode", "shared", "idle", "dialing", "leased")
 
     def __init__(self) -> None:
         self.mode: str | None = None  # None (unknown) | "h1" | "h2"
         self.shared: typing.Any = None  # the h2 connection
         self.idle: list[tuple[typing.Any, float]] = []  # (h1 conn, idle_since); LIFO
         self.dialing: typing.Any = None  # event while a coalesced dial is in flight
+        self.leased = 0  # h1 conns checked out exclusively
 
 
 class ConnectionPool:
@@ -98,9 +99,12 @@ class ConnectionPool:
         to_close = []
         with self._lock:
             host = self._hosts.get(origin)
+            if host is not None:
+                host.leased -= 1
             if conn.closed or host is None or self._closed:
                 self._count -= 1
                 to_close.append(conn)
+                self._prune_locked(origin)
             else:
                 host.idle.append((conn, self._backend.monotonic()))
                 to_close.extend(self._evict_over_keepalive_locked())
@@ -156,6 +160,7 @@ class ConnectionPool:
                     stale.append(conn)
                     self._count -= 1
                 else:
+                    host.leased += 1
                     return "conn", (conn, True), stale
 
             if host.dialing is not None and host.mode != "h1":
@@ -170,6 +175,7 @@ class ConnectionPool:
 
             event = self._backend.event()
             self._waiters.append(event)
+            self._prune_locked(origin)
             return "wait", event, stale
 
     async def _dial(self, origin: Origin, connect_timeout: float | None) -> typing.Any:
@@ -199,6 +205,7 @@ class ConnectionPool:
             event = None
             if host is not None and host.dialing is not None:
                 event, host.dialing = host.dialing, None
+            self._prune_locked(origin)
         if event is not None:
             event.set()
         self._wake_waiters()
@@ -214,6 +221,7 @@ class ConnectionPool:
                 exclusive = False
             else:
                 host.mode = "h1"
+                host.leased += 1
                 exclusive = True
         if event is not None:
             event.set()
@@ -241,6 +249,7 @@ class ConnectionPool:
                 if host is not None and host.shared is conn:
                     host.shared = None
                     self._count -= 1
+                    self._prune_locked(origin)
             await self._close_conn(conn)
             self._wake_waiters()
             return False
@@ -269,14 +278,22 @@ class ConnectionPool:
             return []
         evicted = []
         while sum(len(host.idle) for host in self._hosts.values()) > cap:
-            oldest_host = min(
-                (host for host in self._hosts.values() if host.idle),
-                key=lambda host: host.idle[0][1],
+            origin, oldest_host = min(
+                ((origin, host) for origin, host in self._hosts.items() if host.idle),
+                key=lambda item: item[1].idle[0][1],
             )
             conn, _ = oldest_host.idle.pop(0)
             evicted.append(conn)
             self._count -= 1
+            self._prune_locked(origin)
         return evicted
+
+    def _prune_locked(self, origin: Origin) -> None:
+        """Under the lock: drop the origin's entry once nothing references it.
+        Only the cached `mode` hint is lost; `setdefault` recreates on demand."""
+        host = self._hosts.get(origin)
+        if host is not None and host.shared is None and not host.idle and host.dialing is None and host.leased == 0:
+            del self._hosts[origin]
 
     async def _close_all(self, conns: list[typing.Any]) -> None:
         for conn in conns:
