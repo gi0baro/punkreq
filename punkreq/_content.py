@@ -19,7 +19,12 @@ _CHUNK_SIZE = 65_536
 
 
 class AsyncByteStream:
-    """Base class for request/response byte streams."""
+    """Base class for request/response byte streams.
+
+    Contract: `__aiter__` must return an async iterator supporting `aclose()`
+    (an async generator satisfies this). punkreq closes every iterator it
+    opens deterministically — finalization is never left to the GC, whose
+    unwind of a suspended async generator cannot be relied upon."""
 
     def __aiter__(self) -> typing.AsyncIterator[bytes]:
         raise NotImplementedError()
@@ -79,9 +84,18 @@ class IteratorByteStream(AsyncByteStream):
 
 
 class AsyncIteratorByteStream(AsyncByteStream):
-    """A body backed by an async iterable of bytes. Single-shot."""
+    """A body backed by an async iterable of bytes. Single-shot.
+
+    The iterable must support `aclose()` (an async generator does) so an
+    aborted upload can close it deterministically; anything else is rejected
+    up front rather than failing mid-teardown."""
 
     def __init__(self, aiterable: typing.AsyncIterable[bytes]) -> None:
+        if not hasattr(aiterable, "aclose"):
+            raise TypeError(
+                "Async iterable content must support 'aclose()' so the body can be "
+                "closed deterministically: pass an async generator, or implement 'aclose()'."
+            )
         self._aiterable = aiterable
         self._is_stream_consumed = False
 
@@ -96,10 +110,9 @@ class AsyncIteratorByteStream(AsyncByteStream):
             yield chunk
 
     async def close(self) -> None:
-        # `aclose` here is the async-generator protocol method, not punkreq naming
-        aclose = getattr(self._aiterable, "aclose", None)
-        if aclose is not None:
-            await aclose()
+        # `aclose` here is the async-generator protocol method, not punkreq
+        # naming; its presence is guaranteed by the constructor check
+        await self._aiterable.aclose()  # type: ignore[attr-defined]
 
 
 def peek_filelike_length(stream: typing.Any) -> int | None:

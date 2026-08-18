@@ -64,6 +64,19 @@ class TestEncodeContent:
         with pytest.raises(StreamConsumed):
             run(collect(stream))
 
+    def test_async_iterable_without_aclose_rejected(self):
+        # contract: async content must be closable deterministically — reject
+        # up front instead of failing (or silently skipping) at teardown
+        class PlainAiterable:
+            def __aiter__(self):
+                return self._gen()
+
+            async def _gen(self):
+                yield b"hello"
+
+        with pytest.raises(TypeError, match="aclose"):
+            encode_request(content=PlainAiterable())
+
     def test_invalid_type(self):
         with pytest.raises(TypeError):
             encode_request(content=123)

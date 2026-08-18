@@ -44,6 +44,7 @@ class ScriptedConnection:
         self.handler = handler
         self.multiplexed = multiplexed
         self.closed = False
+        self.busy = False  # httpunk >= 0.1.4: exchange holds the in-flight slot
         self.requests = []
 
     async def __aenter__(self):

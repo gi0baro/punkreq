@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import threading
 import typing
 
 import httpunk
@@ -97,9 +98,12 @@ def _to_httpunk_request(request: Request, *, h2: bool, proxy: ProxyInfo | None =
 class _PooledStream(AsyncByteStream):
     """Adapts an httpunk response body to `AsyncByteStream`, bounding each read
     with the `read` timeout and releasing the connection exactly once — on
-    natural end, on error, or on early close. httpunk's `Response.aclose()` is
-    a no-op after a full read and closes/resets the connection otherwise, so
-    the pool's `.closed` check does the right thing in every case."""
+    natural end, on error, or on early close. The release is gated on
+    completion, not on the connection's own `.closed` state: httpunk's
+    `Response.aclose()` closes/resets the connection on a partial read, but
+    that teardown can be interrupted (cancellation, GC-driven unwind) before
+    the connection learns it is dead — so anything short of a fully-read body
+    releases with `discard=True` and is dropped instead of parked."""
 
     def __init__(
         self,
@@ -109,7 +113,7 @@ class _PooledStream(AsyncByteStream):
         backend: typing.Any,
         read_timeout: float | None,
         deadline: float | None,
-        release: typing.Callable[[], typing.Awaitable[None]] | None,
+        release: typing.Callable[..., typing.Awaitable[None]] | None,
     ) -> None:
         self._response = httpunk_response
         self._request = request
@@ -118,6 +122,16 @@ class _PooledStream(AsyncByteStream):
         self._deadline = deadline
         self._release = release
         self._finalized = False
+        # `_complete` is flipped synchronously when the body ends naturally —
+        # before any await in the close path — so it survives an interrupted
+        # teardown. It is the release gate: a connection whose exchange did not
+        # complete is discarded, never parked (`release(discard=True)`).
+        self._complete = False
+        # close() must be enter-once even across threads: a double entry would
+        # release the connection to the pool twice (double `leased` decrement,
+        # double-parked conn). Free-threaded GC can drive an unwind concurrently
+        # with a user-driven close, so a plain flag check is not enough.
+        self._close_lock = threading.Lock()
         self._on_finish: list[typing.Callable[[], typing.Any]] = []
 
     @property
@@ -133,43 +147,62 @@ class _PooledStream(AsyncByteStream):
         return self._iterate()
 
     async def _iterate(self) -> typing.AsyncIterator[bytes]:
+        # The inner iterator is closed deterministically in the finally: the
+        # runtime does not finalize abandoned async generators (a GC-driven
+        # unwind dies at its first suspension), so every wrapper in the chain
+        # must aclose what it opened. The finally also runs on GeneratorExit,
+        # making this stream self-cleaning when a consumer stops early.
         iterator = self._response.aiter_bytes()
-        while True:
+        try:
+            while True:
+                try:
+                    effective = self._read_timeout
+                    if self._deadline is not None:
+                        remaining = self._deadline - self._backend.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutException("Exceeded the total request timeout", request=self._request)
+                        effective = remaining if effective is None else min(effective, remaining)
+                    if effective is None:
+                        chunk = await iterator.__anext__()
+                    else:
+                        result, completed = await self._backend.timeout(iterator.__anext__(), effective)
+                        if not completed:
+                            raise ReadTimeout("Timed out reading the response body", request=self._request)
+                        chunk = result
+                except StopAsyncIteration:
+                    self._complete = True  # sync flip, before any teardown await
+                    break
+                except BaseException as exc:
+                    raise map_httpunk_exception(exc, self._request)
+                yield chunk
+        finally:
             try:
-                effective = self._read_timeout
-                if self._deadline is not None:
-                    remaining = self._deadline - self._backend.monotonic()
-                    if remaining <= 0:
-                        raise TimeoutException("Exceeded the total request timeout", request=self._request)
-                    effective = remaining if effective is None else min(effective, remaining)
-                if effective is None:
-                    chunk = await iterator.__anext__()
-                else:
-                    result, completed = await self._backend.timeout(iterator.__anext__(), effective)
-                    if not completed:
-                        raise ReadTimeout("Timed out reading the response body", request=self._request)
-                    chunk = result
-            except StopAsyncIteration:
-                break
-            except BaseException as exc:
+                await iterator.aclose()
+            finally:
                 await self.close()
-                raise map_httpunk_exception(exc, self._request)
-            yield chunk
-        await self.close()
 
     async def close(self) -> None:
-        if self._finalized:
-            return
-        self._finalized = True
+        with self._close_lock:
+            if self._finalized:
+                return
+            self._finalized = True
+        discard = not self._complete
         try:
             await self._response.aclose()
+        except BaseException:
+            # the abort didn't complete; whatever the connection's own state
+            # says, it must not be reused
+            discard = True
+            raise
         finally:
-            if self._release is not None:
-                await self._release()
-            for callback in self._on_finish:
-                result = callback()
-                if result is not None and hasattr(result, "__await__"):
-                    await result
+            try:
+                if self._release is not None:
+                    await self._release(discard=discard)
+            finally:
+                for callback in self._on_finish:
+                    result = callback()
+                    if result is not None and hasattr(result, "__await__"):
+                        await result
 
 
 class PoolTransport:
@@ -202,10 +235,11 @@ class PoolTransport:
                 httpunk_response = await self._send_on(conn, request, self._effective(timeout.read, deadline, request))
             except BaseException as exc:
                 if exclusive:
-                    # the connection is mid-exchange and unusable: force-close so
-                    # release drops it instead of pooling a corrupt connection
-                    await self._pool._close_conn(conn)
-                    await self._pool.release(origin, conn)
+                    # the connection is mid-exchange and unusable: discard it —
+                    # release updates the pool's books synchronously and closes
+                    # the connection itself, so even if the close is interrupted
+                    # the conn is already off the books, never parked
+                    await self._pool.release(origin, conn, discard=True)
                 if _is_retryable_nack(exc, reused) and replayable and attempts < _MAX_NACK_RETRIES:
                     attempts += 1
                     continue

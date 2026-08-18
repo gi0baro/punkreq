@@ -116,6 +116,14 @@ class Response:
         self._elapsed: datetime.timedelta | None = None
         self._cookies: Cookies | None = None
         self._num_bytes_downloaded = 0
+        # The iterator most recently handed out by a public iter_* method.
+        # `async for ... break` abandons its iterator (the language never
+        # closes it), and an abandoned suspended async generator is left to GC
+        # — whose one-shot unwind can't drive the awaits on the teardown path.
+        # Owning it here keeps it alive until close() acloses it in a real
+        # await context. A single slot suffices: only one streaming chain can
+        # exist per response (`is_stream_consumed`).
+        self._body_iterator: typing.AsyncGenerator[typing.Any, None] | None = None
 
         self.is_closed = False
         self.is_stream_consumed = False
@@ -316,8 +324,12 @@ class Response:
             self._content = b"".join([chunk async for chunk in self.iter_bytes()])
         return self._content
 
-    async def iter_bytes(self, chunk_size: int | None = None) -> typing.AsyncIterator[bytes]:
+    def iter_bytes(self, chunk_size: int | None = None) -> typing.AsyncIterator[bytes]:
         """Stream the body with content decoding applied."""
+        self._body_iterator = iterator = self._iter_bytes(chunk_size)
+        return iterator
+
+    async def _iter_bytes(self, chunk_size: int | None = None) -> typing.AsyncIterator[bytes]:
         if self._content is not None:
             size = len(self._content) if chunk_size is None else chunk_size
             for i in range(0, len(self._content), max(size, 1)):
@@ -325,7 +337,7 @@ class Response:
             return
         decoder = self._get_content_decoder()
         chunker = ByteChunker(chunk_size)
-        inner = self.iter_raw()
+        inner = self._iter_raw()
         try:
             async for raw in inner:
                 for chunk in chunker.decode(decoder.decode(raw)):
@@ -337,28 +349,45 @@ class Response:
         for chunk in chunker.flush():
             yield chunk
 
-    async def iter_raw(self, chunk_size: int | None = None) -> typing.AsyncIterator[bytes]:
+    def iter_raw(self, chunk_size: int | None = None) -> typing.AsyncIterator[bytes]:
         """Stream the body as received on the wire, without content decoding."""
+        self._body_iterator = iterator = self._iter_raw(chunk_size)
+        return iterator
+
+    async def _iter_raw(self, chunk_size: int | None = None) -> typing.AsyncIterator[bytes]:
         if self.is_stream_consumed:
             raise StreamConsumed()
         if self.is_closed:
             raise StreamClosed()
         self.is_stream_consumed = True
         chunker = ByteChunker(chunk_size)
+        # Own the stream's iterator and aclose it deterministically: `async for`
+        # does not close its iterator on early exit, and an abandoned suspended
+        # async generator is only finalized by GC — whose synchronous unwind
+        # dies at the first await, cutting the connection teardown short.
+        # `aclose` is part of the `AsyncByteStream.__aiter__` contract.
+        inner = self.stream.__aiter__()
         try:
-            async for raw in self.stream:
+            async for raw in inner:
                 self._num_bytes_downloaded += len(raw)
                 for chunk in chunker.decode(raw):
                     yield chunk
             for chunk in chunker.flush():
                 yield chunk
         finally:
-            await self.close()
+            try:
+                await inner.aclose()  # type: ignore[attr-defined]
+            finally:
+                await self.close()
 
-    async def iter_text(self, chunk_size: int | None = None) -> typing.AsyncIterator[str]:
+    def iter_text(self, chunk_size: int | None = None) -> typing.AsyncIterator[str]:
+        self._body_iterator = iterator = self._iter_text(chunk_size)
+        return iterator
+
+    async def _iter_text(self, chunk_size: int | None = None) -> typing.AsyncIterator[str]:
         decoder = TextDecoder(self.encoding)
         chunker = TextChunker(chunk_size)
-        inner = self.iter_bytes()
+        inner = self._iter_bytes()
         try:
             async for content in inner:
                 for chunk in chunker.decode(decoder.decode(content)):
@@ -370,9 +399,13 @@ class Response:
         for chunk in chunker.flush():
             yield chunk
 
-    async def iter_lines(self) -> typing.AsyncIterator[str]:
+    def iter_lines(self) -> typing.AsyncIterator[str]:
+        self._body_iterator = iterator = self._iter_lines()
+        return iterator
+
+    async def _iter_lines(self) -> typing.AsyncIterator[str]:
         decoder = LineDecoder()
-        inner = self.iter_text()
+        inner = self._iter_text()
         try:
             async for text in inner:
                 for line in decoder.decode(text):
@@ -387,7 +420,17 @@ class Response:
         exchange is aborted. Idempotent."""
         if not self.is_closed:
             self.is_closed = True
-            await self.stream.close()
+            iterator, self._body_iterator = self._body_iterator, None
+            try:
+                # Close the handed-out iterator: a consumer that broke out of
+                # `async for` abandoned its suspended generator, and GC must
+                # never be the one to unwind it. Skip it while running —
+                # close() re-enters from its own unwind path (`_iter_raw`'s
+                # finally), and that unwind is already doing the closing.
+                if iterator is not None and not iterator.ag_running:
+                    await iterator.aclose()
+            finally:
+                await self.stream.close()
 
     async def __aenter__(self) -> Response:
         return self

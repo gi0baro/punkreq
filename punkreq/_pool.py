@@ -93,15 +93,23 @@ class ConnectionPool:
             # action == "wait": either a coalesced dial or pool capacity
             await self._wait(value, deadline)
 
-    async def release(self, origin: Origin, conn: typing.Any) -> None:
+    async def release(self, origin: Origin, conn: typing.Any, *, discard: bool = False) -> None:
         """Return an exclusively-held (h1) connection to the idle set, or close
-        it if it is no longer reusable."""
+        it if it is no longer reusable. `discard=True` means the caller knows
+        the last exchange did not complete cleanly (body not fully read, abort
+        interrupted mid-teardown): such a connection must never be parked as
+        keepalive, regardless of what `conn.closed` claims — its close path may
+        have been cut off before the connection learned it was dead."""
         to_close = []
         with self._lock:
             host = self._hosts.get(origin)
             if host is not None:
                 host.leased -= 1
-            if conn.closed or host is None or self._closed:
+            # `conn.busy` (httpunk >= 0.1.4) is the parser-level truth that an
+            # exchange still holds the connection's in-flight slot: a release
+            # interrupted mid-teardown can leave it set with `closed` still
+            # False, and parking such a conn would wedge the next request.
+            if discard or conn.closed or conn.busy or host is None or self._closed:
                 self._count -= 1
                 to_close.append(conn)
                 self._prune_locked(origin)
@@ -156,7 +164,7 @@ class ConnectionPool:
             expiry = self._limits.keepalive_expiry
             while host.idle:
                 conn, since = host.idle.pop()
-                if conn.closed or (expiry is not None and now - since >= expiry):
+                if conn.closed or conn.busy or (expiry is not None and now - since >= expiry):
                     stale.append(conn)
                     self._count -= 1
                 else:

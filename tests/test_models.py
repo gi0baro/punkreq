@@ -5,7 +5,7 @@ import pytest
 
 import punkreq
 from punkreq import Request, Response
-from punkreq._content import AsyncIteratorByteStream
+from punkreq._content import AsyncByteStream, AsyncIteratorByteStream
 
 
 def run(coro):
@@ -191,6 +191,76 @@ class TestResponseStreaming:
             return b"".join([chunk async for chunk in response.iter_raw()])
 
         assert run(collect()) == payload
+
+    def test_iter_raw_aborted_closes_stream_iterator(self):
+        # early exit must aclose the stream's iterator deterministically
+        # (`async for` alone abandons it to GC) and close the response
+        class TrackingStream(AsyncByteStream):
+            def __init__(self):
+                self.iter_finalized = False
+                self.close_calls = 0
+
+            def __aiter__(self):
+                return self._iterate()
+
+            async def _iterate(self):
+                try:
+                    yield b"one"
+                    yield b"two"
+                finally:
+                    self.iter_finalized = True
+
+            async def close(self):
+                self.close_calls += 1
+
+        stream = TrackingStream()
+        response = Response(200, stream=stream)
+
+        async def main():
+            raw = response.iter_raw()
+            assert await raw.__anext__() == b"one"
+            await raw.aclose()
+
+        run(main())
+        assert stream.iter_finalized
+        assert stream.close_calls == 1
+        assert response.is_closed
+
+    def test_close_closes_abandoned_iterator(self):
+        # `async for ... break` abandons its generator (the language never
+        # closes it); Response.close() must aclose handed-out iterators
+        # deterministically instead of leaving them to GC
+        class TrackingStream(AsyncByteStream):
+            def __init__(self):
+                self.iter_finalized = False
+                self.close_calls = 0
+
+            def __aiter__(self):
+                return self._iterate()
+
+            async def _iterate(self):
+                try:
+                    yield b"one"
+                    yield b"two"
+                finally:
+                    self.iter_finalized = True
+
+            async def close(self):
+                self.close_calls += 1
+
+        stream = TrackingStream()
+        response = Response(200, stream=stream)
+
+        async def main():
+            body = response.iter_bytes()
+            assert await body.__anext__() == b"one"
+            # no aclose: simulate `async for ... break` abandonment
+            await response.close()
+
+        run(main())
+        assert stream.iter_finalized
+        assert stream.close_calls == 1
+        assert response.is_closed
 
     def test_stream_consumed_twice_raises(self):
         response = Response(200, stream=stream_of(b"x"))

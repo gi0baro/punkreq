@@ -31,12 +31,12 @@ classifiers = [
 ]
 
 dependencies = [
-    "httpunk~=0.1.0",
+    "httpunk~=0.1.4",
 ]
 
 [project.optional-dependencies]
 brotli = ["brotli~=1.2.0"]
-tonio = ["tonio~=0.8.1; python_version >= '3.14'"]
+tonio = ["tonio~=0.9.7; python_version >= '3.14'"]
 
 [dependency-groups]
 lint = [

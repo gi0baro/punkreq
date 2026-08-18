@@ -21,6 +21,7 @@ class FakeConnection:
     def __init__(self, multiplexed=False):
         self.multiplexed = multiplexed
         self.closed = False
+        self.busy = False  # httpunk >= 0.1.4: exchange holds the in-flight slot
         self.entered = False
 
     async def __aenter__(self):
@@ -321,6 +322,66 @@ class TestHostPruning:
             await pool.close()
 
         run(main())
+
+
+class TestDiscard:
+    def test_release_discard_drops_open_connection(self):
+        connector = FakeConnector()
+
+        async def main():
+            pool = make_pool(connector)
+            conn, _, _ = await pool.acquire(ORIGIN)
+            assert not conn.closed
+            # discard: the exchange didn't complete cleanly — the conn must be
+            # closed and dropped even though its own state still claims open
+            await pool.release(ORIGIN, conn, discard=True)
+            assert conn.closed
+            assert pool.idle_count == 0
+            assert pool.connection_count == 0
+            assert len(pool._hosts) == 0
+            conn2, _, reused = await pool.acquire(ORIGIN)
+            assert conn2 is not conn
+            assert not reused
+            await pool.release(ORIGIN, conn2)
+            await pool.close()
+
+        run(main())
+        assert connector.dials == 2
+
+
+class TestBusy:
+    def test_busy_connection_not_parked(self):
+        connector = FakeConnector()
+
+        async def main():
+            pool = make_pool(connector)
+            conn, _, _ = await pool.acquire(ORIGIN)
+            conn.busy = True  # release was interrupted; the exchange still holds the slot
+            await pool.release(ORIGIN, conn)
+            assert conn.closed
+            assert pool.idle_count == 0
+            await pool.close()
+
+        run(main())
+
+    def test_busy_idle_connection_dropped_at_acquire(self):
+        connector = FakeConnector()
+
+        async def main():
+            pool = make_pool(connector)
+            conn, _, _ = await pool.acquire(ORIGIN)
+            await pool.release(ORIGIN, conn)
+            assert pool.idle_count == 1
+            conn.busy = True
+            conn2, _, _ = await pool.acquire(ORIGIN)
+            assert conn2 is not conn
+            assert conn.closed
+            assert pool.connection_count == 1
+            await pool.release(ORIGIN, conn2)
+            await pool.close()
+
+        run(main())
+        assert connector.dials == 2
 
 
 class TestLimitsAndTimeouts:
