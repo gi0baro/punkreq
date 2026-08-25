@@ -2,12 +2,13 @@ import asyncio
 
 import httpunk.asyncio
 import pytest
-from httpunk import Backend
+from httpunk import Backend, GoAwayError, H2Reason, HeaderMap, StreamResetError
+from httpunk.exceptions import ConnectionClosedError
 
-from punkreq import Request, Response
+from punkreq import RemoteProtocolError, Request, Response
 from punkreq._connect import Connector
 from punkreq._pool import ConnectionPool
-from punkreq._transport import PoolTransport, _PooledStream
+from punkreq._transport import PoolTransport, _is_retryable_nack, _PooledStream
 
 
 def run(coro):
@@ -195,5 +196,177 @@ class TestAbortReuse:
                 assert dials[0] == 1  # keep-alive reuse survived the gating
             server.close()
             await server.wait_closed()
+
+        run(main())
+
+
+def _unsent(exc):
+    exc.request_unsent = True
+    return exc
+
+
+class TestNackPolicy:
+    """`_is_retryable_nack`: the failure classes where the server demonstrably
+    never processed the request, gated on the body still being resendable."""
+
+    def test_request_unsent_retries_any_body_on_reused(self):
+        exc = _unsent(ConnectionClosedError("connection closed"))
+        assert _is_retryable_nack(exc, reused=True, replayable=False)
+        assert _is_retryable_nack(exc, reused=True, replayable=True)
+
+    def test_request_unsent_fresh_connection_never_retries(self):
+        exc = _unsent(ConnectionClosedError("connection closed"))
+        assert not _is_retryable_nack(exc, reused=False, replayable=True)
+
+    def test_request_unsent_marker_works_on_any_exception_type(self):
+        # the idle-bytes poison error carries the marker on a ValueError
+        exc = _unsent(ValueError("received 7 unexpected bytes on an idle HTTP/1 connection"))
+        assert _is_retryable_nack(exc, reused=True, replayable=False)
+
+    def test_closed_without_marker_needs_replayable(self):
+        exc = ConnectionClosedError("connection closed before the response head")
+        assert _is_retryable_nack(exc, reused=True, replayable=True)
+        assert not _is_retryable_nack(exc, reused=True, replayable=False)
+        assert not _is_retryable_nack(exc, reused=False, replayable=True)
+
+    def test_h2_nacks_need_replayable(self):
+        goaway = GoAwayError(0, int(H2Reason.NO_ERROR))
+        assert _is_retryable_nack(goaway, reused=False, replayable=True)
+        assert not _is_retryable_nack(goaway, reused=False, replayable=False)
+        refused = StreamResetError(1, int(H2Reason.REFUSED_STREAM))
+        assert _is_retryable_nack(refused, reused=False, replayable=True)
+        assert not _is_retryable_nack(refused, reused=False, replayable=False)
+        assert not _is_retryable_nack(GoAwayError(0, int(H2Reason.PROTOCOL_ERROR)), reused=True, replayable=True)
+
+    def test_unrelated_errors_never_retry(self):
+        assert not _is_retryable_nack(OSError("boom"), reused=True, replayable=True)
+
+
+class _NackResponse:
+    status = 200
+
+    def __init__(self):
+        self.headers = HeaderMap()
+
+    async def aiter_bytes(self):
+        yield b"ok"
+
+    async def aclose(self):
+        pass
+
+
+class _NackConnection:
+    """A pool-facing h1 connection whose next send can fail with the
+    `request_unsent` marker (httpunk raising before the writer spawn)."""
+
+    multiplexed = False
+
+    def __init__(self):
+        self.closed = False
+        self.busy = False
+        self.fail_next = None  # exception to raise on the next send_request
+        self.bodies_touched = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, exc_tb):
+        self.closed = True
+        return False
+
+    async def send_request(self, request):
+        if self.fail_next is not None:
+            exc, self.fail_next = self.fail_next, None
+            raise exc
+        if request.body is not None and not isinstance(request.body, bytes):
+            self.bodies_touched += 1
+            async for _ in request.body:
+                pass
+        return _NackResponse()
+
+
+class TestNackRetry:
+    """The transport's retry loop over `_is_retryable_nack`."""
+
+    @staticmethod
+    def _streamed_request(url):
+        async def body():
+            yield b"upload"
+
+        return Request("POST", url, content=body())
+
+    @staticmethod
+    async def _park_conn(transport):
+        # complete one exchange so the connection is parked (next acquire -> reused)
+        response = await transport.send(Request("GET", "http://example.com/warm"))
+        await response.read()
+
+    def _setup(self):
+        conns = []
+
+        async def connector(origin):
+            conn = _NackConnection()
+            conns.append(conn)
+            return conn
+
+        pool = ConnectionPool(connector, backend=Backend.asyncio.create())
+        return conns, pool, PoolTransport(pool, backend=Backend.asyncio.create())
+
+    def test_streamed_body_retried_when_request_unsent(self):
+        async def main():
+            conns, pool, transport = self._setup()
+            async with pool:
+                await self._park_conn(transport)
+                conns[0].fail_next = _unsent(ConnectionClosedError("connection closed"))
+                response = await transport.send(self._streamed_request("http://example.com/upload"))
+                assert response.status_code == 200
+                assert await response.read() == b"ok"
+                assert len(conns) == 2  # dead conn discarded, retry redialed
+                assert conns[0].closed
+                assert conns[0].bodies_touched == 0  # the streamed body was never iterated
+                assert conns[1].bodies_touched == 1
+
+        run(main())
+
+    def test_streamed_body_not_retried_without_marker(self):
+        async def main():
+            conns, pool, transport = self._setup()
+            async with pool:
+                await self._park_conn(transport)
+                conns[0].fail_next = ConnectionClosedError("connection closed before the response head")
+                with pytest.raises(RemoteProtocolError):
+                    await transport.send(self._streamed_request("http://example.com/upload"))
+                assert len(conns) == 1  # no retry: the body may have been consumed
+
+        run(main())
+
+    def test_replayable_body_still_retried_without_marker(self):
+        async def main():
+            conns, pool, transport = self._setup()
+            async with pool:
+                await self._park_conn(transport)
+                conns[0].fail_next = ConnectionClosedError("connection closed before the response head")
+                response = await transport.send(Request("POST", "http://example.com/x", content=b"data"))
+                assert response.status_code == 200
+                assert await response.read() == b"ok"
+                assert len(conns) == 2
+
+        run(main())
+
+    def test_request_unsent_on_fresh_connection_not_retried(self):
+        async def main():
+            conns, pool, transport = self._setup()
+            async with pool:
+                # no warm-up: the first acquire dials fresh (reused=False)
+                async def connector_fail(origin):
+                    conn = _NackConnection()
+                    conn.fail_next = _unsent(ConnectionClosedError("connection closed"))
+                    conns.append(conn)
+                    return conn
+
+                pool._connector = connector_fail
+                with pytest.raises(RemoteProtocolError):
+                    await transport.send(self._streamed_request("http://example.com/upload"))
+                assert len(conns) == 1
 
         run(main())

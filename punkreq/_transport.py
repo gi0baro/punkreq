@@ -53,17 +53,27 @@ def map_httpunk_exception(exc: BaseException, request: Request) -> BaseException
     return mapped
 
 
-def _is_retryable_nack(exc: BaseException, reused: bool) -> bool:
+def _is_retryable_nack(exc: BaseException, reused: bool, replayable: bool) -> bool:
     """reqwest's conservative retry policy: only failures where the server
-    demonstrably never processed the request."""
+    demonstrably never processed the request — and only when the body can
+    still be resent (from memory, or because it was provably never touched)."""
     if isinstance(exc, GoAwayError):
-        return exc.error_code == H2Reason.NO_ERROR
+        return replayable and exc.error_code == H2Reason.NO_ERROR
     if isinstance(exc, StreamResetError):
-        return exc.error_code == H2Reason.REFUSED_STREAM
-    if isinstance(exc, ConnectionClosedError):
-        # h1 keep-alive race: the server closed an idle connection while we
-        # reused it. Only safe when the connection had served traffic before.
+        return replayable and exc.error_code == H2Reason.REFUSED_STREAM
+    if getattr(exc, "request_unsent", False):
+        # httpunk >= 0.2.0 (h1): the failure was raised before the request was
+        # handed to the body writer — nothing reached the wire and the body
+        # was never iterated, so even a streamed body is intact and safe to
+        # resend (hyper's `TrySendError` request give-back; the `reused` gate
+        # mirrors hyper-util's "a fresh connection means we can't retry").
         return reused
+    if isinstance(exc, ConnectionClosedError):
+        # h1 keep-alive race past the writer hand-off: the server closed the
+        # connection as we reused it, but body bytes may have been consumed.
+        # Only safe when the connection had served traffic before AND the body
+        # replays from memory.
+        return reused and replayable
     return False
 
 
@@ -240,7 +250,7 @@ class PoolTransport:
                     # the connection itself, so even if the close is interrupted
                     # the conn is already off the books, never parked
                     await self._pool.release(origin, conn, discard=True)
-                if _is_retryable_nack(exc, reused) and replayable and attempts < _MAX_NACK_RETRIES:
+                if _is_retryable_nack(exc, reused, replayable) and attempts < _MAX_NACK_RETRIES:
                     attempts += 1
                     continue
                 raise map_httpunk_exception(exc, request)
