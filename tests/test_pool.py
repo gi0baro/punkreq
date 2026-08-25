@@ -458,3 +458,225 @@ class TestLimitsAndTimeouts:
                 await pool.acquire(ORIGIN)
 
         run(main())
+
+
+THIRD_ORIGIN = Origin("https", "third.dev", 443)
+
+
+class TestCapacityReclaim:
+    """At `max_connections`, idle capacity is reclaimable — stale purge first,
+    then LRU across idle h1 conns and zero-lease h2 shared conns. A request
+    waits only while every counted connection is genuinely in flight."""
+
+    def test_new_origin_reclaims_lru_idle_at_capacity(self):
+        connector = FakeConnector()
+
+        async def main():
+            backend = SteppingBackend(Backend.asyncio.create())
+            pool = ConnectionPool(connector, backend=backend, limits=Limits(max_connections=2))
+            first, _, _ = await pool.acquire(ORIGIN)
+            await pool.release(ORIGIN, first)
+            second, _, _ = await pool.acquire(OTHER_ORIGIN)
+            await pool.release(OTHER_ORIGIN, second)
+            # at cap, all idle: a third origin must not starve
+            third, _, reused = await asyncio.wait_for(pool.acquire(THIRD_ORIGIN), 1.0)
+            assert not reused
+            assert first.closed  # LRU victim: parked earliest
+            assert not second.closed
+            assert pool.connection_count == 2
+            await pool.release(THIRD_ORIGIN, third)
+            await pool.close()
+
+        run(main())
+        assert connector.dials == 3
+
+    def test_stale_reclaimed_before_live(self):
+        connector = FakeConnector()
+
+        async def main():
+            backend = SteppingBackend(Backend.asyncio.create())
+            pool = ConnectionPool(connector, backend=backend, limits=Limits(max_connections=2))
+            first, _, _ = await pool.acquire(ORIGIN)
+            await pool.release(ORIGIN, first)
+            second, _, _ = await pool.acquire(OTHER_ORIGIN)
+            await pool.release(OTHER_ORIGIN, second)
+            second.closed = True  # dies while parked — NEWER than first
+            await asyncio.wait_for(pool.acquire(THIRD_ORIGIN), 1.0)
+            # the stale purge freed the slot; the live (older) conn survives
+            assert not first.closed
+            assert pool.connection_count == 2
+            await pool.close()
+
+        run(main())
+
+    def test_expired_idle_of_other_origin_reclaimed(self):
+        connector = FakeConnector()
+
+        async def main():
+            pool = make_pool(connector, max_connections=1, keepalive_expiry=0.01)
+            first, _, _ = await pool.acquire(ORIGIN)
+            await pool.release(ORIGIN, first)
+            await asyncio.sleep(0.03)
+            second, _, _ = await asyncio.wait_for(pool.acquire(OTHER_ORIGIN), 1.0)
+            assert first.closed
+            assert pool.connection_count == 1
+            await pool.release(OTHER_ORIGIN, second)
+            await pool.close()
+
+        run(main())
+
+    def test_all_in_flight_still_waits(self):
+        connector = FakeConnector()
+
+        async def main():
+            pool = make_pool(connector, max_connections=1)
+            conn, _, _ = await pool.acquire(ORIGIN)  # leased, in flight
+            with pytest.raises(punkreq.PoolTimeout):
+                await pool.acquire(OTHER_ORIGIN, pool_timeout=0.02)
+            await pool.release(ORIGIN, conn)
+            await pool.close()
+
+        run(main())
+
+    def test_release_unblocks_waiting_origin(self):
+        connector = FakeConnector()
+
+        async def main():
+            pool = make_pool(connector, max_connections=1)
+            conn, _, _ = await pool.acquire(ORIGIN)
+
+            task = asyncio.ensure_future(pool.acquire(OTHER_ORIGIN))
+            await asyncio.sleep(0.02)
+            assert not task.done()  # blocked: the only conn is in flight
+            await pool.release(ORIGIN, conn)  # parked idle -> reclaimable
+            other, _, _ = await asyncio.wait_for(task, 1.0)
+            assert conn.closed  # reclaimed for the new origin
+            assert pool.connection_count == 1
+            await pool.release(OTHER_ORIGIN, other)
+            await pool.close()
+
+        run(main())
+        assert connector.dials == 2
+
+    def test_idle_shared_h2_reclaimed(self):
+        async def connector(origin):
+            return FakeConnection(multiplexed=(origin == ORIGIN))
+
+        async def main():
+            pool = make_pool(connector, max_connections=1)
+            shared, exclusive, _ = await pool.acquire(ORIGIN)
+            assert not exclusive
+            await pool.release(ORIGIN, shared)  # zero leases -> reclaimable
+            other, _, _ = await asyncio.wait_for(pool.acquire(OTHER_ORIGIN), 1.0)
+            assert shared.closed
+            assert pool.connection_count == 1
+            await pool.release(OTHER_ORIGIN, other)
+            await pool.close()
+
+        run(main())
+
+    def test_leased_shared_h2_not_reclaimed(self):
+        async def connector(origin):
+            return FakeConnection(multiplexed=(origin == ORIGIN))
+
+        async def main():
+            pool = make_pool(connector, max_connections=1)
+            shared, _, _ = await pool.acquire(ORIGIN)  # lease held, no release
+            with pytest.raises(punkreq.PoolTimeout):
+                await pool.acquire(OTHER_ORIGIN, pool_timeout=0.02)
+            await pool.release(ORIGIN, shared)
+            await pool.close()
+
+        run(main())
+
+    def test_lru_is_protocol_blind(self):
+        # the h2 conn went idle BEFORE the h1 conn was parked: the h2 conn is
+        # the victim — eviction never depends on the negotiated protocol
+        async def connector(origin):
+            return FakeConnection(multiplexed=(origin == ORIGIN))
+
+        async def main():
+            backend = SteppingBackend(Backend.asyncio.create())
+            pool = ConnectionPool(connector, backend=backend, limits=Limits(max_connections=2))
+            shared, _, _ = await pool.acquire(ORIGIN)
+            await pool.release(ORIGIN, shared)  # h2 idle-since: t1
+            h1conn, _, _ = await pool.acquire(OTHER_ORIGIN)
+            await pool.release(OTHER_ORIGIN, h1conn)  # h1 parked-since: t2 > t1
+            await asyncio.wait_for(pool.acquire(THIRD_ORIGIN), 1.0)
+            assert shared.closed
+            assert not h1conn.closed
+            await pool.close()
+
+        run(main())
+
+
+class TestSharedLeases:
+    """The owner-side h2 stream-lease bookkeeping (`shared_leases`) that makes
+    a stream-less shared connection recognizable as reclaimable capacity."""
+
+    def test_lease_bookkeeping(self):
+        connector = FakeConnector(multiplexed=True)
+
+        async def main():
+            pool = make_pool(connector)
+            conn, _, _ = await pool.acquire(ORIGIN)  # install: first lease
+            again, _, _ = await pool.acquire(ORIGIN)  # checkout: second
+            assert again is conn
+            host = pool._hosts[ORIGIN]
+            assert host.shared_leases == 2
+            await pool.release(ORIGIN, conn)
+            assert host.shared_leases == 1
+            await pool.release(ORIGIN, conn)
+            assert host.shared_leases == 0
+            assert host.shared_idle_since > 0.0
+            await pool.close()
+
+        run(main())
+
+    def test_ready_failure_gives_back_lease_and_redials(self):
+        class NotReady(FakeConnection):
+            def __init__(self):
+                super().__init__(multiplexed=True)
+                self.fail_ready = False
+
+            async def ready(self):
+                if self.fail_ready:
+                    raise RuntimeError("GOAWAY")
+                await super().ready()
+
+        async def connector(origin):
+            return NotReady()
+
+        async def main():
+            pool = make_pool(connector)
+            conn, _, _ = await pool.acquire(ORIGIN)
+            await pool.release(ORIGIN, conn)
+            conn.fail_ready = True
+            conn2, _, _ = await pool.acquire(ORIGIN)  # ready() fails: evict + redial
+            assert conn2 is not conn
+            assert conn.closed
+            assert pool.connection_count == 1
+            assert pool._hosts[ORIGIN].shared_leases == 1  # the fresh install's lease
+            await pool.release(ORIGIN, conn2)
+            await pool.close()
+
+        run(main())
+
+    def test_late_release_of_replaced_shared_is_noop(self):
+        connector = FakeConnector(multiplexed=True)
+
+        async def main():
+            pool = make_pool(connector)
+            old, _, _ = await pool.acquire(ORIGIN)
+            old.closed = True  # dies with its lease still out
+            new, _, _ = await pool.acquire(ORIGIN)  # checkout evicts + redials
+            assert new is not old
+            count = pool.connection_count
+            leases = pool._hosts[ORIGIN].shared_leases
+            await pool.release(ORIGIN, old)  # late release for the evicted conn
+            assert pool.connection_count == count  # identity guard: no double decrement
+            assert pool._hosts[ORIGIN].shared_leases == leases
+            await pool.release(ORIGIN, new)
+            await pool.close()
+
+        run(main())

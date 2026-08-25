@@ -101,6 +101,10 @@ class Limits:
     """Connection pool limits.
 
     * `max_connections` — total concurrent connections; None means unlimited.
+      The cap bounds live work only: at capacity, idle connections (parked h1
+      keepalives, stream-less h2 conns) are reclaimed — stale first, then
+      least-recently-used — so idle capacity never starves a request. A
+      request waits (`Timeout.pool`) only while every connection is in flight.
     * `max_keepalive_connections` — idle connections kept for reuse; None means
       unlimited.
     * `keepalive_expiry` — seconds an idle connection survives in the pool;

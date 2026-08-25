@@ -244,18 +244,19 @@ class PoolTransport:
             try:
                 httpunk_response = await self._send_on(conn, request, self._effective(timeout.read, deadline, request))
             except BaseException as exc:
-                if exclusive:
-                    # the connection is mid-exchange and unusable: discard it —
-                    # release updates the pool's books synchronously and closes
-                    # the connection itself, so even if the close is interrupted
-                    # the conn is already off the books, never parked
-                    await self._pool.release(origin, conn, discard=True)
+                # exclusive (h1): the connection is mid-exchange and unusable —
+                # discard it; release updates the pool's books synchronously and
+                # closes the connection itself, so even if the close is
+                # interrupted the conn is already off the books, never parked.
+                # shared (h2): gives back the stream lease; the connection
+                # itself is only condemned by its own `closed` state.
+                await self._pool.release(origin, conn, discard=True)
                 if _is_retryable_nack(exc, reused, replayable) and attempts < _MAX_NACK_RETRIES:
                     attempts += 1
                     continue
                 raise map_httpunk_exception(exc, request)
 
-            release = functools.partial(self._pool.release, origin, conn) if exclusive else None
+            release = functools.partial(self._pool.release, origin, conn)
             stream = _PooledStream(
                 httpunk_response,
                 request,

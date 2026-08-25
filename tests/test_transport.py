@@ -5,7 +5,7 @@ import pytest
 from httpunk import Backend, GoAwayError, H2Reason, HeaderMap, StreamResetError
 from httpunk.exceptions import ConnectionClosedError
 
-from punkreq import RemoteProtocolError, Request, Response
+from punkreq import LocalProtocolError, RemoteProtocolError, Request, Response
 from punkreq._connect import Connector
 from punkreq._pool import ConnectionPool
 from punkreq._transport import PoolTransport, _is_retryable_nack, _PooledStream
@@ -274,6 +274,10 @@ class _NackConnection:
         self.closed = True
         return False
 
+    async def ready(self):
+        if self.closed:
+            raise RuntimeError("connection is closed")
+
     async def send_request(self, request):
         if self.fail_next is not None:
             exc, self.fail_next = self.fail_next, None
@@ -368,5 +372,63 @@ class TestNackRetry:
                 with pytest.raises(RemoteProtocolError):
                     await transport.send(self._streamed_request("http://example.com/upload"))
                 assert len(conns) == 1
+
+        run(main())
+
+
+class TestSharedLeaseRelease:
+    """The transport releases an h2 stream lease exactly once — on body end,
+    early close, or send failure — so the pool can see a stream-less shared
+    connection as reclaimable capacity."""
+
+    def _setup(self):
+        conns = []
+
+        async def connector(origin):
+            conn = _NackConnection()
+            conn.multiplexed = True
+            conns.append(conn)
+            return conn
+
+        pool = ConnectionPool(connector, backend=Backend.asyncio.create())
+        return conns, pool, PoolTransport(pool, backend=Backend.asyncio.create())
+
+    def test_lease_released_after_body_read(self):
+        async def main():
+            conns, pool, transport = self._setup()
+            async with pool:
+                response = await transport.send(Request("GET", "http://example.com/a"))
+                host = next(iter(pool._hosts.values()))
+                assert host.shared_leases == 1  # body not read yet
+                assert await response.read() == b"ok"
+                assert host.shared_leases == 0
+                assert pool.connection_count == 1  # the conn itself stays pooled
+
+        run(main())
+
+    def test_lease_released_on_early_close(self):
+        async def main():
+            conns, pool, transport = self._setup()
+            async with pool:
+                response = await transport.send(Request("GET", "http://example.com/a"))
+                host = next(iter(pool._hosts.values()))
+                await response.close()  # aborted body: lease back, conn NOT condemned
+                assert host.shared_leases == 0
+                assert not conns[0].closed
+                assert pool.connection_count == 1
+
+        run(main())
+
+    def test_lease_released_on_send_failure(self):
+        async def main():
+            conns, pool, transport = self._setup()
+            async with pool:
+                response = await transport.send(Request("GET", "http://example.com/a"))
+                await response.read()
+                host = next(iter(pool._hosts.values()))
+                conns[0].fail_next = ValueError("broken framing")  # non-retryable
+                with pytest.raises(LocalProtocolError):
+                    await transport.send(Request("GET", "http://example.com/b"))
+                assert host.shared_leases == 0
 
         run(main())
