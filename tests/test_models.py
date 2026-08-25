@@ -28,6 +28,11 @@ class TestRequest:
         assert request.headers["host"] == "example.com"
         assert request.content == b""
 
+    def test_timeout_field(self):
+        assert Request("GET", "https://example.com/").timeout is None
+        request = Request("GET", "https://example.com/", timeout=3.0)
+        assert request.timeout == punkreq.Timeout(3.0)  # normalized to Timeout
+
     def test_host_header_with_port_and_ipv6(self):
         assert Request("GET", "https://example.com:8443/").headers["host"] == "example.com:8443"
         assert Request("GET", "http://[::1]:8080/").headers["host"] == "[::1]:8080"

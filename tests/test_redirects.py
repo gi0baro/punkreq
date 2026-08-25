@@ -120,7 +120,9 @@ class TestLocation:
         with pytest.raises(punkreq.UnsupportedProtocol):
             build_redirect_request(request, response)
 
-    def test_timeout_extension_propagated(self):
-        request = Request("GET", "https://example.com/a", extensions={"timeout": "marker"})
+    def test_timeout_and_deadline_propagated(self):
+        request = Request("GET", "https://example.com/a", timeout=punkreq.Timeout(5.0, total=30.0))
+        request._deadline = 123.45  # pinned by Client.send before the first hop
         next_request = build_redirect_request(request, redirect_response(request))
-        assert next_request.extensions["timeout"] == "marker"
+        assert next_request.timeout == punkreq.Timeout(5.0, total=30.0)
+        assert next_request._deadline == 123.45

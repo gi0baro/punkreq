@@ -156,7 +156,6 @@ class BaseClient:
         params: QueryParamTypes = None,
         headers: HeaderTypes = None,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
-        extensions: typing.Mapping[str, typing.Any] | None = None,
     ) -> Request:
         """A `Request` with the client's configuration merged in. Pair with `send()`."""
         merged_url = self._merge_url(url)
@@ -172,8 +171,6 @@ class BaseClient:
             resolved_timeout = self.timeout
         else:
             resolved_timeout = Timeout(timeout) if timeout is not None else Timeout(None)
-        merged_extensions = dict(extensions) if extensions is not None else {}
-        merged_extensions.setdefault("timeout", resolved_timeout)
 
         request = Request(
             method,
@@ -184,7 +181,7 @@ class BaseClient:
             json=json,
             params=merged_params,
             headers=merged_headers,
-            extensions=merged_extensions,
+            timeout=resolved_timeout,
         )
 
         # URL userinfo becomes basic auth and is stripped from the wire (reqwest)
@@ -216,11 +213,10 @@ class BaseClient:
 
         start = self._backend.monotonic()
         # pin the total-timeout deadline before the first hop so it spans the
-        # whole redirect chain (redirect requests inherit extensions)
-        raw_timeout = request.extensions.get("timeout")
-        total = Timeout(raw_timeout).total if raw_timeout is not None else None
-        if total is not None:
-            request.extensions.setdefault("deadline", start + total)
+        # whole redirect chain (redirect requests inherit it)
+        total = request.timeout.total if request.timeout is not None else None
+        if total is not None and request._deadline is None:
+            request._deadline = start + total
 
         history: list[Response] = []
         while True:
@@ -277,7 +273,6 @@ class BaseClient:
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
-        extensions: typing.Mapping[str, typing.Any] | None = None,
     ) -> ResponseHandle:
         return ResponseHandle(
             self._request(
@@ -292,7 +287,6 @@ class BaseClient:
                 auth=auth,
                 follow_redirects=follow_redirects,
                 timeout=timeout,
-                extensions=extensions,
             )
         )
 
@@ -310,7 +304,6 @@ class BaseClient:
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
-        extensions: typing.Mapping[str, typing.Any] | None = None,
     ) -> Response:
         request = self.build_request(
             method,
@@ -322,7 +315,6 @@ class BaseClient:
             params=params,
             headers=headers,
             timeout=timeout,
-            extensions=extensions,
         )
         return await self.send(request, auth=auth, follow_redirects=follow_redirects)
 
@@ -335,7 +327,6 @@ class BaseClient:
         auth=USE_CLIENT_DEFAULT,
         follow_redirects=USE_CLIENT_DEFAULT,
         timeout=USE_CLIENT_DEFAULT,
-        extensions=None,
     ) -> ResponseHandle:
         return self.request(
             "GET",
@@ -345,7 +336,6 @@ class BaseClient:
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
-            extensions=extensions,
         )
 
     def options(
@@ -357,7 +347,6 @@ class BaseClient:
         auth=USE_CLIENT_DEFAULT,
         follow_redirects=USE_CLIENT_DEFAULT,
         timeout=USE_CLIENT_DEFAULT,
-        extensions=None,
     ) -> ResponseHandle:
         return self.request(
             "OPTIONS",
@@ -367,7 +356,6 @@ class BaseClient:
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
-            extensions=extensions,
         )
 
     def head(
@@ -379,7 +367,6 @@ class BaseClient:
         auth=USE_CLIENT_DEFAULT,
         follow_redirects=USE_CLIENT_DEFAULT,
         timeout=USE_CLIENT_DEFAULT,
-        extensions=None,
     ) -> ResponseHandle:
         return self.request(
             "HEAD",
@@ -389,7 +376,6 @@ class BaseClient:
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
-            extensions=extensions,
         )
 
     def delete(
@@ -401,7 +387,6 @@ class BaseClient:
         auth=USE_CLIENT_DEFAULT,
         follow_redirects=USE_CLIENT_DEFAULT,
         timeout=USE_CLIENT_DEFAULT,
-        extensions=None,
     ) -> ResponseHandle:
         return self.request(
             "DELETE",
@@ -411,7 +396,6 @@ class BaseClient:
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
-            extensions=extensions,
         )
 
     def post(
@@ -427,7 +411,6 @@ class BaseClient:
         auth=USE_CLIENT_DEFAULT,
         follow_redirects=USE_CLIENT_DEFAULT,
         timeout=USE_CLIENT_DEFAULT,
-        extensions=None,
     ) -> ResponseHandle:
         return self.request(
             "POST",
@@ -441,7 +424,6 @@ class BaseClient:
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
-            extensions=extensions,
         )
 
     def put(
@@ -457,7 +439,6 @@ class BaseClient:
         auth=USE_CLIENT_DEFAULT,
         follow_redirects=USE_CLIENT_DEFAULT,
         timeout=USE_CLIENT_DEFAULT,
-        extensions=None,
     ) -> ResponseHandle:
         return self.request(
             "PUT",
@@ -471,7 +452,6 @@ class BaseClient:
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
-            extensions=extensions,
         )
 
     def patch(
@@ -487,7 +467,6 @@ class BaseClient:
         auth=USE_CLIENT_DEFAULT,
         follow_redirects=USE_CLIENT_DEFAULT,
         timeout=USE_CLIENT_DEFAULT,
-        extensions=None,
     ) -> ResponseHandle:
         return self.request(
             "PATCH",
@@ -501,7 +480,6 @@ class BaseClient:
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
-            extensions=extensions,
         )
 
     async def close(self) -> None:

@@ -67,4 +67,8 @@ def build_redirect_request(request: Request, response: Response, *, referer: boo
     if referer and not downgrade:
         headers["referer"] = str(request.url.copy_with(userinfo="", fragment=None))
 
-    return Request(method, url, headers=headers, stream=stream, extensions=request.extensions)
+    # the redirect hop inherits the per-request timeout and the pinned
+    # total-timeout deadline, so `total` spans the whole chain
+    next_request = Request(method, url, headers=headers, stream=stream, timeout=request.timeout)
+    next_request._deadline = request._deadline
+    return next_request

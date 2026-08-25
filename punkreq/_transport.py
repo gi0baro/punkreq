@@ -225,11 +225,10 @@ class PoolTransport:
 
     async def send(self, request: Request) -> Response:
         origin = origin_for_url(request.url)
-        raw_timeout = request.extensions.get("timeout")
-        timeout = Timeout(raw_timeout) if raw_timeout is not None else Timeout(None)
-        # the total-timeout deadline; the client stashes it in extensions so it
+        timeout = request.timeout if request.timeout is not None else Timeout(None)
+        # the total-timeout deadline; the client pins it on the request so it
         # spans redirect hops, else it covers this exchange only
-        deadline = request.extensions.get("deadline")
+        deadline = request._deadline
         if deadline is None and timeout.total is not None:
             deadline = self._backend.monotonic() + timeout.total
         replayable = isinstance(request.stream, ByteStream)
@@ -270,7 +269,7 @@ class PoolTransport:
                 headers=Headers(httpunk_response.headers),
                 stream=stream,
                 request=request,
-                extensions={"http_version": "HTTP/2" if _is_multiplexed(conn) else "HTTP/1.1"},
+                http_version="HTTP/2" if _is_multiplexed(conn) else "HTTP/1.1",
             )
 
     def _effective(self, phase: float | None, deadline: float | None, request: Request) -> float | None:

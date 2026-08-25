@@ -8,6 +8,7 @@ import typing
 import warnings
 from http import HTTPStatus
 
+from ._config import Timeout, TimeoutTypes
 from ._content import AsyncByteStream, ByteStream, RequestContent, RequestData, encode_request
 from ._cookies import Cookies
 from ._decoders import (
@@ -49,12 +50,18 @@ class Request:
         files: typing.Any = None,
         json: typing.Any = None,
         stream: AsyncByteStream | None = None,
-        extensions: typing.Mapping[str, typing.Any] | None = None,
+        timeout: TimeoutTypes | Timeout | None = None,
     ) -> None:
         self.method = method.upper()
         self.url = URL(url) if params is None else URL(url).copy_merge_params(params)
         self.headers = Headers(headers)
-        self.extensions: dict[str, typing.Any] = dict(extensions) if extensions is not None else {}
+        # Per-request timeout (reqwest `Request::timeout`): None means "no
+        # per-request override" — the transport applies no timeouts then, and
+        # the client verb methods always resolve one in `build_request`.
+        self.timeout: Timeout | None = Timeout(timeout) if timeout is not None else None
+        # The total-timeout deadline (monotonic), pinned by `Client.send` before
+        # the first hop so it spans the whole redirect chain. Internal.
+        self._deadline: float | None = None
 
         if stream is None:
             content_headers, self.stream = encode_request(content, data, files, json)
@@ -101,13 +108,13 @@ class Response:
         json: typing.Any = None,
         stream: AsyncByteStream | None = None,
         request: Request | None = None,
-        extensions: typing.Mapping[str, typing.Any] | None = None,
+        http_version: str = "HTTP/1.1",
         history: typing.Sequence[Response] | None = None,
         default_encoding: str | typing.Callable[[bytes], str | None] = "utf-8",
     ) -> None:
         self.status_code = int(status_code)
         self.headers = Headers(headers)
-        self.extensions: dict[str, typing.Any] = dict(extensions) if extensions is not None else {}
+        self.http_version = http_version  # reqwest `Response::version`
         self.history: list[Response] = list(history) if history is not None else []
         self.default_encoding = default_encoding
         self._request = request
@@ -164,10 +171,6 @@ class Response:
     def url(self) -> URL:
         """The URL the response came from (post-redirect)."""
         return self.request.url
-
-    @property
-    def http_version(self) -> str:
-        return self.extensions.get("http_version", "HTTP/1.1")
 
     @property
     def reason_phrase(self) -> str:
