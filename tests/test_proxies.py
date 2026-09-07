@@ -6,10 +6,12 @@ import ssl
 import httpunk.asyncio
 import pytest
 import trustme
+from httpunk import Backend
 
 import punkreq
 from punkreq import Proxy
-from punkreq._proxies import ProxyConfig
+from punkreq._connect import create_ssl_context
+from punkreq._proxies import ProxyConfig, TunnelTLSStream
 from punkreq.asyncio import Client
 
 
@@ -161,6 +163,70 @@ class TestPlainHTTPProxy:
             assert b"proxy-authorization: Basic dTpw" in head
             assert b"x-proxy-extra: 1" in head
             assert b"host: upstream.invalid" in head
+
+        run(main())
+
+
+class TestTunnelTLSStream:
+    """The tunnel stream as each httpunk backend sees a TLS transport: the
+    send-time peek (`receive_nowait`, httpunk >= 0.3.0: `None` = nothing ready,
+    `b""` = EOF, else bytes) and the sync `close_transport`."""
+
+    @staticmethod
+    async def _open(ca, upstream_port):
+        backend = Backend.asyncio.create()
+        raw = await backend.connect_tcp("127.0.0.1", upstream_port)
+        closes = []
+        with ca.cert_pem.tempfile() as ca_path:
+            context = create_ssl_context(verify=ca_path)
+        context.set_alpn_protocols(["http/1.1"])
+        tls = TunnelTLSStream(raw, context, server_hostname="127.0.0.1", closer=lambda: closes.append(1))
+        await tls.handshake()
+        return backend, raw, tls, closes
+
+    def test_peek_contract_and_close(self, ca):
+        async def main():
+            upstream, upstream_port = await _start_upstream(_upstream_tls(ca, ["http/1.1"]))
+            backend, raw, tls, closes = await self._open(ca, upstream_port)
+            assert tls.selected_alpn_protocol() == "http/1.1"
+            # nothing decrypted yet: "not ready", NOT the EOF that `b""` now means
+            assert tls.read_nowait() is None
+            assert backend.receive_nowait(tls) is None
+
+            await tls.send_all(b"GET /peek HTTP/1.1\r\nhost: x\r\n\r\n")
+            first = await tls.receive_some(1)  # decrypts the record: the rest is pending
+            assert first == b"H"
+            rest = tls.read_nowait()
+            assert rest and rest.startswith(b"TTP/1.1 200")
+
+            backend.close_transport(tls)
+            backend.close_transport(tls)  # idempotent
+            assert closes == [1]
+            raw.close()
+            upstream.close()
+            await upstream.wait_closed()
+
+        run(main())
+
+    def test_tonio_backend_shape(self, ca):
+        """The tonio backend finds a TLS transport by `_ssl` and reaches into it as
+        into its own `_SSLProxy` (`_lock`, `_inner`); it closes through `.transport`."""
+        pytest.importorskip("tonio")
+        tonio_backend = Backend.tonio.create()
+
+        async def main():
+            upstream, upstream_port = await _start_upstream(_upstream_tls(ca, ["http/1.1"]))
+            _, raw, tls, closes = await self._open(ca, upstream_port)
+            assert tonio_backend.receive_nowait(tls) is None
+            await tls.send_all(b"GET /peek HTTP/1.1\r\nhost: x\r\n\r\n")
+            assert await tls.receive_some(1) == b"H"
+            pending = tonio_backend.receive_nowait(tls)
+            assert pending and pending.startswith(b"TTP/1.1 200")
+            tonio_backend.close_transport(tls)
+            assert closes == [1]
+            raw.close()
+            upstream.close()
+            await upstream.wait_closed()
 
         run(main())
 

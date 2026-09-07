@@ -2,7 +2,7 @@ import asyncio
 import gzip
 
 import pytest
-from httpunk import GoAwayError, H2Reason, HeaderMap, StreamResetError
+from httpunk import GoAwayError, H2Reason, HeaderMap, StreamResetError, Version
 from httpunk.exceptions import ConnectionClosedError
 
 import punkreq
@@ -20,6 +20,7 @@ class FakeHTTPunkResponse:
         self._chunks = [body] if isinstance(body, bytes) else list(body)
         self._chunk_delay = chunk_delay
         self._conn = None  # set by ScriptedConnection.send_request
+        self.version = Version.HTTP_11  # stamped per protocol by ScriptedConnection.send_request
         self._consumed = False
         self.closed = False
 
@@ -65,6 +66,7 @@ class ScriptedConnection:
             result = await result
         if isinstance(result, FakeHTTPunkResponse):
             result._conn = self
+            result.version = Version.HTTP_2 if self.multiplexed else Version.HTTP_11
         return result
 
 

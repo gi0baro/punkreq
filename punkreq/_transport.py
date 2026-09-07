@@ -6,7 +6,14 @@ import typing
 
 import httpunk
 from httpunk import GoAwayError, H2Reason, StreamResetError
-from httpunk.exceptions import ConnectionClosedError, H2Error, H2UserError, HTTPunkError
+from httpunk.exceptions import (
+    ConnectionClosedError,
+    H1IncompleteMessageError,
+    H1UserError,
+    H2Error,
+    H2UserError,
+    HTTPunkError,
+)
 
 from ._config import Timeout
 from ._connect import origin_for_url
@@ -30,6 +37,12 @@ __all__ = ["PoolTransport"]
 
 _MAX_NACK_RETRIES = 2
 
+# The peer went away with our exchange in flight: the transport failed (hyper's
+# `Io`, both protocols), or on h1 it closed cleanly before the response head
+# (hyper's `IncompleteMessage`, httpunk >= 0.3.0 — a sibling under `H1Error`, not
+# a `ConnectionClosedError`). The same "server disconnected" verdict either way.
+_DISCONNECTED = (ConnectionClosedError, H1IncompleteMessageError)
+
 
 def map_httpunk_exception(exc: BaseException, request: Request) -> BaseException:
     """Translate an httpunk (or OS-level) failure into the punkreq hierarchy."""
@@ -39,9 +52,11 @@ def map_httpunk_exception(exc: BaseException, request: Request) -> BaseException
         return exc
     message = str(exc) or type(exc).__name__
     mapped: HTTPError
-    if isinstance(exc, (H2UserError, ValueError)):
+    if isinstance(exc, (H1UserError, H2UserError, ValueError)):
+        # local misuse: hyper's `Kind::User` on h1, the h2 state machine's API
+        # errors, and the `http` crate's constructor validation (`ValueError`)
         mapped = LocalProtocolError(message)
-    elif isinstance(exc, ConnectionClosedError):
+    elif isinstance(exc, _DISCONNECTED):
         mapped = RemoteProtocolError(f"Server disconnected: {message}")
     elif isinstance(exc, (H2Error, HTTPunkError)):
         mapped = RemoteProtocolError(message)
@@ -65,12 +80,17 @@ def _is_retryable_nack(exc: BaseException, reused: bool, replayable: bool) -> bo
         # httpunk >= 0.2.0 (h1): the failure was raised before the request was
         # handed to the body writer — nothing reached the wire and the body
         # was never iterated, so even a streamed body is intact and safe to
-        # resend (hyper's `TrySendError` request give-back; the `reused` gate
-        # mirrors hyper-util's "a fresh connection means we can't retry").
+        # resend (hyper's `try_send_request` give-back, client/conn/http1.rs:
+        # an error "before trying to serialize the request" returns the
+        # message). The `reused` gate is punkreq's own policy: a give-back on a
+        # fresh connection means the origin is failing at dial time, and a
+        # redial would only fail the same way — only an idle keep-alive
+        # connection dying underneath us is a nack worth one more try.
         return reused
-    if isinstance(exc, ConnectionClosedError):
+    if isinstance(exc, _DISCONNECTED):
         # h1 keep-alive race past the writer hand-off: the server closed the
-        # connection as we reused it, but body bytes may have been consumed.
+        # connection as we reused it (EOF before the response head, hyper's
+        # `IncompleteMessage`), but body bytes may have been consumed.
         # Only safe when the connection had served traffic before AND the body
         # replays from memory.
         return reused and replayable
@@ -269,7 +289,7 @@ class PoolTransport:
                 headers=Headers(httpunk_response.headers),
                 stream=stream,
                 request=request,
-                http_version="HTTP/2" if _is_multiplexed(conn) else "HTTP/1.1",
+                http_version=str(httpunk_response.version),  # httpunk.Version, `http::Version` names
             )
 
     def _effective(self, phase: float | None, deadline: float | None, request: Request) -> float | None:

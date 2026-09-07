@@ -100,6 +100,19 @@ class Connector:
         self._ssl_context = ssl_context
         self._http1 = http1
         self._http2 = http2
+        if http1 and http2:
+            self.alpn: tuple[str, ...] = ("h2", "http/1.1")
+        elif http2:
+            self.alpn = ("h2",)
+        else:
+            self.alpn = ("http/1.1",)
+        # The ALPN offer is configured on the context ONCE, here: a context is
+        # shared by every dial that uses it (and by `ProxyConnector`'s CONNECT
+        # tunnels, whose `wrap_bio` takes ALPN from the context alone), so the
+        # dial path never mutates it (hyper-util / httpunk `util.connect`
+        # discipline: a caller-supplied context is never touched per connect).
+        if ssl_context is not None:
+            ssl_context.set_alpn_protocols(list(self.alpn))
 
     async def __call__(self, origin: Origin) -> H1Connection | H2Connection:
         try:
@@ -110,12 +123,9 @@ class Connector:
             raise ConnectError(f"Failed to connect to {origin}: {exc}")
 
     async def _connect_tls(self, origin: Origin) -> H1Connection | H2Connection:
-        if self._http1 and self._http2:
-            alpn: tuple[str, ...] = ("h2", "http/1.1")
-        elif self._http2:
-            alpn = ("h2",)
-        else:
-            alpn = ("http/1.1",)
+        # our context already carries the offer; a backend-created default one
+        # (no context given) is configured per dial
+        alpn = None if self._ssl_context is not None else self.alpn
         stream, selected = await self._backend.connect_tls(
             origin.host, origin.port, alpn=alpn, ssl_context=self._ssl_context
         )

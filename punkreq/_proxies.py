@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ssl
+import threading
 import typing
 from urllib.parse import urlsplit
 
@@ -55,10 +56,48 @@ class ProxyConfig:
         return None
 
 
+class _TunnelSSL:
+    """The tunnel's `ssl.SSLObject` behind one lock, in the shape of tonio's
+    `_SSLProxy` (`_inner` + `_lock`): the tonio backend's send-time peek
+    (`receive_nowait`) finds a TLS transport by its `_ssl` attribute and, since
+    httpunk 0.3.0, takes that lock to make its pending-then-read one step against
+    a reader decrypting on another thread. Every use of the SSL object here goes
+    through the same lock, so the peek is safe beside this stream's own reads."""
+
+    __slots__ = ("_inner", "_lock")
+
+    def __init__(self, inner: ssl.SSLObject) -> None:
+        self._inner = inner
+        self._lock = threading.Lock()
+
+    def do_handshake(self) -> None:
+        with self._lock:
+            self._inner.do_handshake()
+
+    def read(self, max_bytes: int) -> bytes:
+        with self._lock:
+            return self._inner.read(max_bytes)
+
+    def write(self, data: memoryview) -> int:
+        with self._lock:
+            return self._inner.write(data)
+
+    def pending(self) -> int:
+        with self._lock:
+            return self._inner.pending()
+
+    def selected_alpn_protocol(self) -> str | None:
+        with self._lock:
+            return self._inner.selected_alpn_protocol()
+
+
 class TunnelTLSStream:
     """TLS over an arbitrary bidirectional stream (the CONNECT tunnel), via
     `ssl.MemoryBIO`. Presents the httpunk stream interface (`receive_some`,
-    `send_all`, `close`, `read_nowait`) so H1/H2 connections sit on it directly."""
+    `send_all`, `close`, `read_nowait`) so H1/H2 connections sit on it directly,
+    plus what each backend's `receive_nowait` / `close_transport` expect of a TLS
+    transport (asyncio: `read_nowait` + `close`; tonio: `_ssl` shaped like its
+    `_SSLProxy`, and `.transport` with a sync `close`)."""
 
     def __init__(
         self,
@@ -71,9 +110,15 @@ class TunnelTLSStream:
         self._inner = inner
         self._incoming = ssl.MemoryBIO()
         self._outgoing = ssl.MemoryBIO()
-        self._ssl = context.wrap_bio(self._incoming, self._outgoing, server_hostname=server_hostname)
+        self._ssl = _TunnelSSL(context.wrap_bio(self._incoming, self._outgoing, server_hostname=server_hostname))
         self._closer = closer
         self._closed = False
+
+    @property
+    def transport(self) -> TunnelTLSStream:
+        """What the tonio backend closes synchronously for a TLS transport (its
+        `TLSStream.transport` is the underlying socket): the tunnel's own close."""
+        return self
 
     async def handshake(self) -> None:
         while True:
@@ -124,12 +169,16 @@ class TunnelTLSStream:
             view = view[sent:]
         await self._flush()
 
-    def read_nowait(self, max_bytes: int = 65536) -> bytes:
+    def read_nowait(self, max_bytes: int = 65536) -> bytes | None:
         """Decrypted bytes already buffered in the SSL object, without touching
-        the tunnel (the h1 driver's pre-request unexpected-bytes check)."""
+        the tunnel (the h1 driver's pre-request unexpected-bytes check). The
+        backend `receive_nowait` contract (httpunk >= 0.3.0): `None` when nothing
+        is ready, `b""` only at EOF (a `close_notify` already decrypted)."""
         try:
             return self._ssl.read(max_bytes)
-        except (ssl.SSLWantReadError, ssl.SSLZeroReturnError):
+        except ssl.SSLWantReadError:
+            return None
+        except ssl.SSLZeroReturnError:
             return b""
 
     def close(self) -> None:
@@ -156,16 +205,9 @@ class ProxyConnector:
         self._http1 = http1
         self._http2 = http2
         self._config = config
+        # the direct connector configures the ALPN offer on `ssl_context` at
+        # construction; `wrap_bio` (the CONNECT tunnel) takes it from the context
         self._direct = Connector(backend=backend, ssl_context=ssl_context, http1=http1, http2=http2)
-        if http1 and http2:
-            alpn: list[str] = ["h2", "http/1.1"]
-        elif http2:
-            alpn = ["h2"]
-        else:
-            alpn = ["http/1.1"]
-        # wrap_bio takes ALPN from the context; the direct dial path sets the
-        # same list on the same context, so this stays consistent
-        ssl_context.set_alpn_protocols(alpn)
 
     async def __call__(self, origin: Origin) -> typing.Any:
         intercept = self._config.matcher.intercept(f"{origin.scheme}://{origin.authority}/")

@@ -38,7 +38,34 @@ async def _start(protocol):
     return server, server.sockets[0].getsockname()[1]
 
 
+async def _start_http10():
+    """A raw HTTP/1.0 server: one close-delimited response per connection."""
+
+    async def handle(reader, writer):
+        while b"\r\n\r\n" not in await reader.read(65536):
+            pass
+        writer.write(b"HTTP/1.0 200 OK\r\ncontent-type: text/plain\r\n\r\nold school")
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    return server, server.sockets[0].getsockname()[1]
+
+
 class TestClientE2E:
+    def test_http10_response_version(self):
+        async def main():
+            server, port = await _start_http10()
+            async with Client() as client:
+                response = await client.get(f"http://127.0.0.1:{port}/")
+                assert response.status_code == 200
+                assert response.http_version == "HTTP/1.0"  # the peer's version, not the connection's protocol
+                assert await response.read() == b"old school"
+            server.close()
+            await server.wait_closed()
+
+        run(main())
+
     def test_h1_get_and_post_with_keepalive(self):
         async def main():
             server, port = await _start(_EchoJson)

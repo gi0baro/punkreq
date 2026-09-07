@@ -2,13 +2,20 @@ import asyncio
 
 import httpunk.asyncio
 import pytest
-from httpunk import Backend, GoAwayError, H2Reason, HeaderMap, StreamResetError
-from httpunk.exceptions import ConnectionClosedError
+from httpunk import Backend, GoAwayError, H2Reason, HeaderMap, StreamResetError, Version
+from httpunk.exceptions import (
+    ConnectionClosedError,
+    H1IncompleteMessageError,
+    H1ParseError,
+    H1UnexpectedMessageError,
+    H1UserError,
+    H2UserError,
+)
 
 from punkreq import LocalProtocolError, RemoteProtocolError, Request, Response
 from punkreq._connect import Connector
 from punkreq._pool import ConnectionPool
-from punkreq._transport import PoolTransport, _is_retryable_nack, _PooledStream
+from punkreq._transport import PoolTransport, _is_retryable_nack, _PooledStream, map_httpunk_exception
 
 
 def run(coro):
@@ -223,11 +230,26 @@ class TestNackPolicy:
         exc = _unsent(ValueError("received 7 unexpected bytes on an idle HTTP/1 connection"))
         assert _is_retryable_nack(exc, reused=True, replayable=False)
 
-    def test_closed_without_marker_needs_replayable(self):
-        exc = ConnectionClosedError("connection closed before the response head")
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            # httpunk >= 0.3.0 h1: EOF before the response head (hyper `IncompleteMessage`)
+            H1IncompleteMessageError("connection closed before message completed: no response head"),
+            # a transport failure with the exchange in flight (hyper `Io`, h1 + h2)
+            ConnectionClosedError("connection closed"),
+        ],
+    )
+    def test_disconnected_without_marker_needs_replayable(self, exc):
         assert _is_retryable_nack(exc, reused=True, replayable=True)
         assert not _is_retryable_nack(exc, reused=True, replayable=False)
         assert not _is_retryable_nack(exc, reused=False, replayable=True)
+
+    def test_other_h1_errors_never_retry(self):
+        # unexpected bytes past a response poison the connection: a genuine
+        # protocol violation, not a nack (only its `request_unsent` re-raise on
+        # the next send is retried, and that goes through the marker branch)
+        assert not _is_retryable_nack(H1UnexpectedMessageError("7 bytes"), reused=True, replayable=True)
+        assert not _is_retryable_nack(H1ParseError("Version", "invalid HTTP version"), reused=True, replayable=True)
 
     def test_h2_nacks_need_replayable(self):
         goaway = GoAwayError(0, int(H2Reason.NO_ERROR))
@@ -242,8 +264,40 @@ class TestNackPolicy:
         assert not _is_retryable_nack(OSError("boom"), reused=True, replayable=True)
 
 
+class TestExceptionMapping:
+    """`map_httpunk_exception`: httpunk's taxonomy onto punkreq's."""
+
+    request = Request("GET", "http://example.com/")
+
+    def test_local_misuse_is_local(self):
+        for exc in (H1UserError("unexpected_header", "unexpected header"), H2UserError("x", "bad"), ValueError("v")):
+            mapped = map_httpunk_exception(exc, self.request)
+            assert isinstance(mapped, LocalProtocolError), exc
+            assert mapped.request is self.request
+
+    def test_disconnect_is_remote_with_server_disconnected(self):
+        for exc in (
+            H1IncompleteMessageError("connection closed before message completed: no response head"),
+            ConnectionClosedError("connection closed"),
+        ):
+            mapped = map_httpunk_exception(exc, self.request)
+            assert isinstance(mapped, RemoteProtocolError), exc
+            assert str(mapped).startswith("Server disconnected: ")
+
+    def test_peer_violations_are_remote(self):
+        for exc in (H1ParseError("Version", "invalid HTTP version"), H1UnexpectedMessageError("7 bytes")):
+            mapped = map_httpunk_exception(exc, self.request)
+            assert isinstance(mapped, RemoteProtocolError), exc
+            assert not str(mapped).startswith("Server disconnected")
+
+    def test_os_error_is_read_error(self):
+        mapped = map_httpunk_exception(OSError("boom"), self.request)
+        assert type(mapped).__name__ == "ReadError"
+
+
 class _NackResponse:
     status = 200
+    version = Version.HTTP_11
 
     def __init__(self):
         self.headers = HeaderMap()
@@ -337,7 +391,7 @@ class TestNackRetry:
             conns, pool, transport = self._setup()
             async with pool:
                 await self._park_conn(transport)
-                conns[0].fail_next = ConnectionClosedError("connection closed before the response head")
+                conns[0].fail_next = H1IncompleteMessageError("connection closed before message completed")
                 with pytest.raises(RemoteProtocolError):
                     await transport.send(self._streamed_request("http://example.com/upload"))
                 assert len(conns) == 1  # no retry: the body may have been consumed
@@ -349,7 +403,7 @@ class TestNackRetry:
             conns, pool, transport = self._setup()
             async with pool:
                 await self._park_conn(transport)
-                conns[0].fail_next = ConnectionClosedError("connection closed before the response head")
+                conns[0].fail_next = H1IncompleteMessageError("connection closed before message completed")
                 response = await transport.send(Request("POST", "http://example.com/x", content=b"data"))
                 assert response.status_code == 200
                 assert await response.read() == b"ok"
