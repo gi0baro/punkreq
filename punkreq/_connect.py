@@ -10,7 +10,7 @@ from httpunk.h2.client import H2Connection
 from ._exceptions import ConnectError, UnsupportedProtocol
 
 
-__all__ = ["Connector", "Origin", "create_ssl_context", "origin_for_url"]
+__all__ = ["Connector", "Origin", "connect_errors", "create_ssl_context", "origin_for_url"]
 
 DEFAULT_PORTS = {"http": 80, "https": 443}
 
@@ -82,6 +82,15 @@ def create_ssl_context(verify: VerifyTypes = True, cert: CertTypes | None = None
     return context
 
 
+def connect_errors(backend: typing.Any) -> tuple[type[BaseException], ...]:
+    """What a dial or a TLS handshake fails with on `backend`: the OS and ssl
+    errors, plus the backend's own transport failure. tonio's `ResourceBroken`
+    is a plain `Exception`, not an `OSError`, and its TLS layer raises it in
+    place of the ssl error, so `(OSError, ssl.SSLError)` alone lets a failed
+    handshake on tonio escape as an unmapped exception."""
+    return (OSError, ssl.SSLError, *backend.broken_transport_errors)
+
+
 class Connector:
     """The default connector: dial `origin` and return the protocol-matching,
     un-entered httpunk connection."""
@@ -108,7 +117,7 @@ class Connector:
             self.alpn = ("http/1.1",)
         # The ALPN offer is configured on the context ONCE, here: a context is
         # shared by every dial that uses it (and by `ProxyConnector`'s CONNECT
-        # tunnels, whose `wrap_bio` takes ALPN from the context alone), so the
+        # tunnels, whose `wrap_tls` takes ALPN from the context alone), so the
         # dial path never mutates it (hyper-util / httpunk `util.connect`
         # discipline: a caller-supplied context is never touched per connect).
         if ssl_context is not None:
@@ -119,7 +128,7 @@ class Connector:
             if origin.scheme == "https":
                 return await self._connect_tls(origin)
             return await self._connect_tcp(origin)
-        except (OSError, ssl.SSLError) as exc:
+        except connect_errors(self._backend) as exc:
             raise ConnectError(f"Failed to connect to {origin}: {exc}")
 
     async def _connect_tls(self, origin: Origin) -> H1Connection | H2Connection:

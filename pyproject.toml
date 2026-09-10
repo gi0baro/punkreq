@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "punkreq"
-version = "0.2.1"
+version = "0.2.2"
 description = "An async HTTP client built on httpunk"
 readme = "README.md"
 license = "BSD-3-Clause"
@@ -32,12 +32,12 @@ classifiers = [
 ]
 
 dependencies = [
-    "httpunk~=0.3.0",
+    "httpunk~=0.4.0",
 ]
 
 [project.optional-dependencies]
 brotli = ["brotli~=1.2.0"]
-tonio = ["tonio~=0.9.15; python_version >= '3.14'"]
+tonio = ["tonio~=0.9.16; python_version >= '3.14'"]
 
 [dependency-groups]
 lint = [
@@ -45,6 +45,7 @@ lint = [
 ]
 test = [
     "pytest>=7.4",
+    "pytest-asyncio>=1.0",
     "trustme>=1.2.1",
 ]
 
@@ -53,6 +54,9 @@ Homepage = 'https://github.com/gi0baro/punkreq'
 Funding = 'https://github.com/sponsors/gi0baro'
 Source = 'https://github.com/gi0baro/punkreq'
 Issues = 'https://github.com/gi0baro/punkreq/issues'
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
 
 [tool.hatch.build.targets.sdist]
 include = [
