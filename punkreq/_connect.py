@@ -4,13 +4,14 @@ import os
 import ssl
 import typing
 
+from httpunk.exceptions import HTTPunkError
 from httpunk.h1.client import H1Connection
 from httpunk.h2.client import H2Connection
 
 from ._exceptions import ConnectError, UnsupportedProtocol
 
 
-__all__ = ["Connector", "Origin", "connect_errors", "create_ssl_context", "origin_for_url"]
+__all__ = ["Connector", "Origin", "connect_errors", "create_ssl_context", "enter_connection", "origin_for_url"]
 
 DEFAULT_PORTS = {"http": 80, "https": 443}
 
@@ -83,17 +84,32 @@ def create_ssl_context(verify: VerifyTypes = True, cert: CertTypes | None = None
 
 
 def connect_errors(backend: typing.Any) -> tuple[type[BaseException], ...]:
-    """What a dial or a TLS handshake fails with on `backend`: the OS and ssl
-    errors, plus the backend's own transport failure. tonio's `ResourceBroken`
+    """What a dial, a TLS handshake or the HTTP handshake fails with on
+    `backend`: the OS and ssl errors, the backend's own transport failure, and
+    httpunk's errors (the peer hanging up or misbehaving while the connection
+    is entered, or during a proxy's CONNECT). tonio's `ResourceBroken`
     is a plain `Exception`, not an `OSError`, and its TLS layer raises it in
     place of the ssl error, so `(OSError, ssl.SSLError)` alone lets a failed
     handshake on tonio escape as an unmapped exception."""
-    return (OSError, ssl.SSLError, *backend.broken_transport_errors)
+    return (OSError, ssl.SSLError, HTTPunkError, *backend.broken_transport_errors)
+
+
+async def enter_connection(conn: typing.Any, transport: typing.Any, backend: typing.Any) -> typing.Any:
+    """Run `conn`'s HTTP handshake (`__aenter__`) and return it. Until that
+    completes the transport we dialed is still ours to close: httpunk closes
+    it on `__aexit__`, which a failed or interrupted `__aenter__` never
+    reaches (h2 waits there for the peer's SETTINGS, pumps already running)."""
+    try:
+        await conn.__aenter__()
+    except BaseException:
+        backend.close_transport(transport)
+        raise
+    return conn
 
 
 class Connector:
-    """The default connector: dial `origin` and return the protocol-matching,
-    un-entered httpunk connection."""
+    """The default connector: dial `origin` and return the protocol-matching
+    httpunk connection, entered."""
 
     def __init__(
         self,
@@ -126,12 +142,14 @@ class Connector:
     async def __call__(self, origin: Origin) -> H1Connection | H2Connection:
         try:
             if origin.scheme == "https":
-                return await self._connect_tls(origin)
-            return await self._connect_tcp(origin)
+                conn, stream = await self._connect_tls(origin)
+            else:
+                conn, stream = await self._connect_tcp(origin)
+            return await enter_connection(conn, stream, self._backend)
         except connect_errors(self._backend) as exc:
             raise ConnectError(f"Failed to connect to {origin}: {exc}")
 
-    async def _connect_tls(self, origin: Origin) -> H1Connection | H2Connection:
+    async def _connect_tls(self, origin: Origin) -> tuple[H1Connection | H2Connection, typing.Any]:
         # our context already carries the offer; a backend-created default one
         # (no context given) is configured per dial
         alpn = None if self._ssl_context is not None else self.alpn
@@ -139,12 +157,12 @@ class Connector:
             origin.host, origin.port, alpn=alpn, ssl_context=self._ssl_context
         )
         if selected == "h2" or not self._http1:
-            return H2Connection(stream, authority=origin.authority, scheme="https", backend=self._backend)
-        return H1Connection(stream, authority=origin.authority, backend=self._backend)
+            return H2Connection(stream, authority=origin.authority, scheme="https", backend=self._backend), stream
+        return H1Connection(stream, authority=origin.authority, backend=self._backend), stream
 
-    async def _connect_tcp(self, origin: Origin) -> H1Connection | H2Connection:
+    async def _connect_tcp(self, origin: Origin) -> tuple[H1Connection | H2Connection, typing.Any]:
         stream = await self._backend.connect_tcp(origin.host, origin.port)
         if not self._http1:
             # h2 prior knowledge over cleartext (reqwest's http2_prior_knowledge)
-            return H2Connection(stream, authority=origin.authority, scheme="http", backend=self._backend)
-        return H1Connection(stream, authority=origin.authority, backend=self._backend)
+            return H2Connection(stream, authority=origin.authority, scheme="http", backend=self._backend), stream
+        return H1Connection(stream, authority=origin.authority, backend=self._backend), stream

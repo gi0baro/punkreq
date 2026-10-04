@@ -117,6 +117,7 @@ class FakeConnector:
             raise punkreq.ConnectError(f"boom dialing {origin}")
         conn = FakeConnection(self.handler, multiplexed=self.multiplexed)
         self.connections.append(conn)
+        await conn.__aenter__()  # a connector hands back an entered connection
         return conn
 
     @property

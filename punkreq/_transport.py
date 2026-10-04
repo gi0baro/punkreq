@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import functools
 import threading
 import typing
@@ -302,12 +303,37 @@ class PoolTransport:
             raise TimeoutException("Exceeded the total request timeout", request=request)
         return remaining if phase is None else min(phase, remaining)
 
+    async def _abort_response(self, response):
+        with contextlib.suppress(Exception):
+            await response.aclose()
+
     async def _send_on(self, conn: typing.Any, request: Request, read_timeout: float | None) -> typing.Any:
         proxy_info = getattr(conn, PROXY_ATTR, None)
         httpunk_request = _to_httpunk_request(request, h2=_is_multiplexed(conn), proxy=proxy_info)
         if read_timeout is None:
             return await conn.send_request(httpunk_request)
-        result, completed = await self._backend.timeout(conn.send_request(httpunk_request), read_timeout)
-        if not completed:
-            raise ReadTimeout("Timed out waiting for the response", request=request)
-        return result
+
+        abandoned, sent, lock = False, [], threading.Lock()
+
+        async def send():
+            response = await conn.send_request(httpunk_request)
+            with lock:
+                if not abandoned:
+                    sent.append(response)
+                    return
+            # the caller is gone: nobody takes it
+            await self._abort_response(response)
+
+        try:
+            _, completed = await self._backend.timeout(send(), read_timeout)
+            if not completed:
+                raise ReadTimeout("Timed out waiting for the response", request=request)
+        except BaseException:
+            with lock:
+                abandoned = True
+                response = sent.pop() if sent else None
+            if response is not None:
+                # the caller gave up: hand over closing
+                self._backend.spawn_detached(self._abort_response(response))
+            raise
+        return sent.pop()

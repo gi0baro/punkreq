@@ -133,7 +133,11 @@ class ConnectionPool:
 
             if action == "dial":
                 conn = await self._dial(origin, connect_timeout)
-                return self._install(origin, conn)
+                installed = self._install(origin, conn)
+                if installed is None:
+                    await self._close_conn(conn)
+                    raise RuntimeError("The connection pool is closed.")
+                return installed
 
             # action == "wait": either a coalesced dial or pool capacity
             await self._wait(value, deadline)
@@ -181,12 +185,19 @@ class ConnectionPool:
         with self._lock:
             self._closed = True
             conns = []
+            dialing = []
             for host in self._hosts.values():
                 if host.shared is not None:
                     conns.append(host.shared)
                 conns.extend(conn for conn, _ in host.idle)
+                if host.dialing is not None:
+                    dialing.append(host.dialing)
             self._hosts.clear()
             self._count = 0
+        # acquirers coalesced on a dial still in flight: its entry is gone, so
+        # nothing else would ever set their event
+        for event in dialing:
+            event.set()
         for conn in conns:
             await self._close_conn(conn)
         self._wake_waiters()
@@ -250,24 +261,38 @@ class ConnectionPool:
             return "wait", event, stale
 
     async def _dial(self, origin: Origin, connect_timeout: float | None) -> typing.Any:
+        if connect_timeout is None:
+            try:
+                return await self._connector(origin)
+            except BaseException:
+                self._abandon_dial(origin)
+                raise
+
+        abandoned, dialed, lock = False, [], threading.Lock()
+
+        async def dial():
+            conn = await self._connector(origin)
+            with lock:
+                if not abandoned:
+                    dialed.append(conn)
+                    return
+            # the caller is gone: nobody takes it
+            await self._close_conn(conn)
+
         try:
-            if connect_timeout is None:
-                conn = await self._connector(origin)
-                await conn.__aenter__()
-            else:
-                result, completed = await self._backend.timeout(self._dial_inner(origin), connect_timeout)
-                if not completed:
-                    raise ConnectTimeout(f"Timed out connecting to {origin}")
-                conn = result
+            _, completed = await self._backend.timeout(dial(), connect_timeout)
+            if not completed:
+                raise ConnectTimeout(f"Timed out connecting to {origin}")
         except BaseException:
+            with lock:
+                abandoned = True
+                conn = dialed.pop() if dialed else None
+            if conn is not None:
+                # the caller gave up: hand over closing
+                self._backend.spawn_detached(self._close_conn(conn))
             self._abandon_dial(origin)
             raise
-        return conn
-
-    async def _dial_inner(self, origin: Origin) -> typing.Any:
-        conn = await self._connector(origin)
-        await conn.__aenter__()
-        return conn
+        return dialed.pop()
 
     def _abandon_dial(self, origin: Origin) -> None:
         with self._lock:
@@ -281,9 +306,13 @@ class ConnectionPool:
             event.set()
         self._wake_waiters()
 
-    def _install(self, origin: Origin, conn: typing.Any) -> tuple[typing.Any, bool, bool]:
-        """Record a freshly-dialed connection and settle the origin's mode."""
+    def _install(self, origin: Origin, conn: typing.Any) -> tuple[typing.Any, bool, bool] | None:
+        """Record a freshly-dialed connection and settle the origin's mode.
+        None when the pool was closed while dialing: the connection is not
+        recorded, and is the caller's to close."""
         with self._lock:
+            if self._closed:
+                return None
             host = self._hosts.setdefault(origin, _HostState())
             event, host.dialing = host.dialing, None
             if _is_multiplexed(conn):
