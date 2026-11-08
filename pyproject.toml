@@ -31,7 +31,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "httpunk~=0.4.4",
+    "httpunk~=0.5.0",
 ]
 
 [project.optional-dependencies]
