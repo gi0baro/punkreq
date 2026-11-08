@@ -10,7 +10,7 @@ from httpunk.h2.client import H2Connection
 from httpunk.util.proxy import Matcher
 
 from ._config import Proxy
-from ._connect import Connector, Origin, connect_errors, enter_connection
+from ._connect import Connector, Origin, connect_errors
 from ._exceptions import ConnectError, ProxyError
 from ._headers import Headers
 from ._urls import URL
@@ -112,7 +112,8 @@ class ProxyConnector:
         transport = await self._dial_proxy(intercept)
         conn = H1Connection(transport, authority=origin.authority, backend=self._backend)
         setattr(conn, PROXY_ATTR, ProxyInfo(auth=intercept.basic_auth(), headers=self._config.headers))
-        return await enter_connection(conn, transport, self._backend)
+        await conn.__aenter__()
+        return conn
 
     async def _tunnel(self, origin: Origin, intercept: typing.Any) -> typing.Any:
         transport = await self._dial_proxy(intercept)
@@ -152,4 +153,5 @@ class ProxyConnector:
             conn = H2Connection(tls, authority=origin.authority, scheme="https", backend=self._backend)
         else:
             conn = H1Connection(tls, authority=origin.authority, backend=self._backend)
-        return await enter_connection(conn, tls, self._backend)
+        await conn.__aenter__()
+        return conn

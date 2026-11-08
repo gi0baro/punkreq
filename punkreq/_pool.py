@@ -11,14 +11,14 @@ Concept mapping (hyper-util `client/pool/*.rs` ≡ `httpunk.util.pool` ≡ here)
   ≡ `_HostState.shared` + `.dialing` + `.mode`. Waiters re-attempt internally
   instead of surfacing `Canceled` — the same retry-by-calling-again
   semantics. A closed shared conn is ditched and redialed at checkout
-  (`Singled::poll_ready` reset; httpunk F35).
+  (`Singled::poll_ready` reset, as httpunk's `Singleton` does).
 * `Cache` (idle set, drop-returns-to-cache) ≡ `_HostState.idle` + `release()`.
   The park check (`discard or closed or busy`) matches httpunk's `_Lease`:
   `closed` mirrors `Cached::poll_ready`-sets-`is_closed` + `Drop` skipping
-  the put; `busy` is the runtime-forced extra (httpunk D3); closing on a
-  failed exchange instead of re-parking is httpunk's F51 choice. Like
-  httpunk's `Cache` (F50), there is no checkout-vs-connect race: an empty
-  idle set dials directly.
+  the put; `busy` is the runtime-forced extra httpunk also adds; closing on
+  a failed exchange instead of re-parking is httpunk's choice too. Like
+  httpunk's `Cache`, there is no checkout-vs-connect race: an empty idle
+  set dials directly.
 
 Policy layered on top (owner-owned, per the modern pool's design — its only
 culling surface is `Cache::retain(predicate)`, everything else is the
