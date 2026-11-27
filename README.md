@@ -3,8 +3,6 @@
 punkreq is an async HTTP client for Python, built on top of
 [httpunk](https://github.com/gi0baro/httpunk).
 
-> **Warning:** punkreq is in an early stage and still work in progress.
-
 > **Note:** punkreq was built with substantial help from LLMs, under human supervision.
 
 ## In a nutshell

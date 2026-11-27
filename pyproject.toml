@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "punkreq"
-version = "0.3.0"
+version = "0.4.0"
 description = "An async HTTP client built on httpunk"
 readme = "README.md"
 license = "BSD-3-Clause"
@@ -31,7 +31,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "httpunk~=0.5.0",
+    "httpunk~=0.6.0",
 ]
 
 [project.optional-dependencies]
