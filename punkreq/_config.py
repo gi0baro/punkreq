@@ -108,7 +108,8 @@ class Limits:
     * `max_keepalive_connections` — idle connections kept for reuse; None means
       unlimited.
     * `keepalive_expiry` — seconds an idle connection survives in the pool;
-      None disables expiry. Defaults to 90s, matching reqwest.
+      None disables expiry. Defaults to 90s, matching reqwest. An h2
+      connection is idle while it has no stream in flight.
     """
 
     __slots__ = ("max_connections", "max_keepalive_connections", "keepalive_expiry")

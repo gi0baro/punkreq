@@ -142,6 +142,32 @@ async def test_h2_dead_shared_connection_redialed(make_pool):
     assert connector.dials == 2
 
 
+async def test_h2_keepalive_expiry(make_pool):
+    connector = FakeConnector(multiplexed=True)
+    pool = make_pool(connector, keepalive_expiry=0.01)
+    conn, _, _ = await pool.acquire(ORIGIN)
+    await pool.release(ORIGIN, conn)
+    await asyncio.sleep(0.03)
+    conn2, _, reused = await pool.acquire(ORIGIN)
+    assert conn2 is not conn
+    assert not reused
+    assert conn.closed
+    assert pool.connection_count == 1
+    await pool.close()
+    assert connector.dials == 2
+
+
+async def test_h2_leased_connection_does_not_expire(make_pool):
+    connector = FakeConnector(multiplexed=True)
+    pool = make_pool(connector, keepalive_expiry=0.01)
+    conn, _, _ = await pool.acquire(ORIGIN)  # lease held, no release
+    await asyncio.sleep(0.03)
+    conn2, _, _ = await pool.acquire(ORIGIN)
+    assert conn2 is conn
+    await pool.close()
+    assert connector.dials == 1
+
+
 async def test_h2_shared_lease_bookkeeping(make_pool):
     pool = make_pool(FakeConnector(multiplexed=True))
     conn, _, _ = await pool.acquire(ORIGIN)  # install: first lease
@@ -403,6 +429,21 @@ async def test_capacity_expired_idle_of_other_origin_reclaimed(make_pool):
     assert first.closed
     assert pool.connection_count == 1
     await pool.release(OTHER_ORIGIN, second)
+    await pool.close()
+
+
+async def test_capacity_expired_shared_h2_reclaimed_as_stale(make_pool):
+    pool = make_pool(FakeConnector(multiplexed=True), max_connections=2, keepalive_expiry=0.01)
+    first, _, _ = await pool.acquire(ORIGIN)
+    await pool.release(ORIGIN, first)
+    second, _, _ = await pool.acquire(OTHER_ORIGIN)
+    await pool.release(OTHER_ORIGIN, second)
+    await asyncio.sleep(0.03)
+    await asyncio.wait_for(pool.acquire(THIRD_ORIGIN), 1.0)
+    # the stale purge takes both; the LRU pass would have taken one
+    assert first.closed
+    assert second.closed
+    assert pool.connection_count == 1
     await pool.close()
 
 

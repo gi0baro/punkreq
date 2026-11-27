@@ -33,9 +33,11 @@ capacity). So when the cap is engaged, idle capacity is treated as
 reclaimable (`_reclaim_capacity_locked`: stale purge, then LRU across idle
 h1 conns and zero-lease shared h2 conns) and a request waits only while
 every counted connection is genuinely in flight. The h2 stream-lease
-bookkeeping (`shared_leases`) exists solely to write that retain predicate:
-upstream's `Singleton` exposes no idleness, by design (RFC 9113 §9.1 — one
-h2 connection per host — is the `Singleton`'s own rationale)."""
+bookkeeping (`shared_leases`) exists to write that retain predicate and to
+apply `keepalive_expiry` to a shared connection, which expires only with no
+stream in flight: upstream's `Singleton` exposes no idleness, by design
+(RFC 9113 §9.1 — one h2 connection per host — is the `Singleton`'s own
+rationale)."""
 
 from __future__ import annotations
 
@@ -74,7 +76,8 @@ class _HostState:
         # Guarded by identity everywhere it is touched (`shared is conn`), so a
         # late release for an evicted/replaced connection is a no-op.
         self.shared_leases = 0
-        self.shared_idle_since = 0.0  # LRU key; meaningful only while shared_leases == 0
+        # LRU key and `keepalive_expiry` clock; meaningful only while shared_leases == 0
+        self.shared_idle_since = 0.0
 
 
 class ConnectionPool:
@@ -219,9 +222,12 @@ class ConnectionPool:
             if self._closed:
                 raise RuntimeError("The connection pool is closed.")
             host = self._hosts.setdefault(origin, _HostState())
+            now = self._backend.monotonic()
+            expiry = self._limits.keepalive_expiry
 
             if host.shared is not None:
-                if host.shared.closed:
+                expired = host.shared_leases == 0 and expiry is not None and now - host.shared_idle_since >= expiry
+                if host.shared.closed or expired:
                     stale.append(host.shared)
                     self._count -= 1
                     host.shared = None
@@ -229,8 +235,6 @@ class ConnectionPool:
                     host.shared_leases += 1  # given back by release()/_h2_ready failure
                     return "conn", (host.shared, False), stale
 
-            now = self._backend.monotonic()
-            expiry = self._limits.keepalive_expiry
             while host.idle:
                 conn, since = host.idle.pop()
                 if conn.closed or conn.busy or (expiry is not None and now - since >= expiry):
@@ -402,8 +406,9 @@ class ConnectionPool:
         expects its owner to drive (see the module docstring). Victims land in
         `stale` (closed by the caller); returns True if a slot was freed.
 
-        Pass 1 purges everything stale — closed shared conns, and idle h1
-        conns that are closed/busy/expired — freeing possibly several slots at
+        Pass 1 purges everything stale — shared conns that are closed, or
+        expired with no lease out, and idle h1 conns that are
+        closed/busy/expired — freeing possibly several slots at
         once (dead weight can serve no one). Only if nothing was stale does
         pass 2 evict the single least-recently-used live entry, comparing idle
         h1 conns (parked-since) and zero-lease shared h2 conns (idle-since) on
@@ -414,7 +419,10 @@ class ConnectionPool:
         expiry = self._limits.keepalive_expiry
         for origin in list(self._hosts):
             host = self._hosts[origin]
-            if host.shared is not None and host.shared.closed:
+            if host.shared is not None and (
+                host.shared.closed
+                or (host.shared_leases == 0 and expiry is not None and now - host.shared_idle_since >= expiry)
+            ):
                 stale.append(host.shared)
                 host.shared = None
                 self._count -= 1
