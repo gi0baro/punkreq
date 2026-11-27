@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 from httpunk import GoAwayError, H2Reason, StreamResetError
-from httpunk.exceptions import ConnectionClosedError
+from httpunk.exceptions import H1IncompleteMessageError
 
 import punkreq
 from tests.fakes import FakeHttpunkResponse, ok_handler
@@ -339,7 +339,7 @@ async def test_retry_h1_idle_reuse_race(make_client):
         # the reused first connection dies on the second exchange
         if request.target == "/second" and conn is connector.connections[0]:
             conn.closed = True
-            raise ConnectionClosedError("server closed idle connection")
+            raise H1IncompleteMessageError("server closed idle connection")
         return FakeHttpunkResponse(200)
 
     client, connector = make_client(handler)
@@ -354,7 +354,7 @@ async def test_retry_h1_idle_reuse_race(make_client):
 async def test_no_retry_h1_close_on_fresh_connection(make_client):
     def handler(request, conn):
         conn.closed = True
-        raise ConnectionClosedError("boom")
+        raise H1IncompleteMessageError("boom")
 
     client, connector = make_client(handler)
     async with client:

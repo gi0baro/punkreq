@@ -7,14 +7,13 @@ import ssl
 import sys
 import typing
 
-from httpunk.exceptions import HTTPunkError
 from httpunk.h1.client import H1Connection
 from httpunk.h2.client import H2Connection
 
 from ._exceptions import ConnectError, UnsupportedProtocol
 
 
-__all__ = ["Connector", "Origin", "connect_errors", "create_ssl_context", "origin_for_url"]
+__all__ = ["Connector", "Origin", "create_ssl_context", "origin_for_url"]
 
 DEFAULT_PORTS = {"http": 80, "https": 443}
 
@@ -88,17 +87,6 @@ def create_ssl_context(verify: VerifyTypes = True, cert: CertTypes | None = None
     return context
 
 
-def connect_errors(backend: typing.Any) -> tuple[type[BaseException], ...]:
-    """What a dial, a TLS handshake or the HTTP handshake fails with on
-    `backend`: the OS and ssl errors, the backend's own transport failure, and
-    httpunk's errors (the peer hanging up or misbehaving while the connection
-    is entered, or during a proxy's CONNECT). tonio's `ResourceBroken`
-    is a plain `Exception`, not an `OSError`, and its TLS layer raises it in
-    place of the ssl error, so `(OSError, ssl.SSLError)` alone lets a failed
-    handshake on tonio escape as an unmapped exception."""
-    return (OSError, ssl.SSLError, HTTPunkError, *backend.broken_transport_errors)
-
-
 class Connector:
     """The default connector: dial `origin` and return the protocol-matching
     httpunk connection, entered."""
@@ -161,7 +149,12 @@ class Connector:
                 conn = await self._connect_tcp(origin)
             await conn.__aenter__()
             return conn
-        except connect_errors(self._backend) as exc:
+        except Exception as exc:
+            # Whatever the dial, the TLS handshake or entering the connection
+            # raises is a connect failure, whichever runtime raised it: tonio's
+            # TLS layer, for one, fails with its own `ResourceBroken`, not an
+            # ssl error (hyper-util: any connector error is its `Connect` kind,
+            # client/legacy/client.rs:517).
             raise ConnectError(f"Failed to connect to {origin}: {exc}")
 
     def _set_socket_options(self, stream):

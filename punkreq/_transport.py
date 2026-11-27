@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import functools
 import threading
 import typing
@@ -8,13 +9,20 @@ import typing
 import httpunk
 from httpunk import GoAwayError, H2Reason, StreamResetError
 from httpunk.exceptions import (
+    BodyError,
+    BodyWriteError,
     ConnectionClosedError,
+    H1BodyError,
     H1IncompleteMessageError,
-    H1UserError,
-    H2Error,
+    H1ParseError,
+    H2FlowControlError,
     H2KeepAliveTimeoutError,
-    H2UserError,
+    H2ProtocolError,
+    HTTPConnectionError,
     HTTPunkError,
+    RequestNotSentError,
+    TransportError as HTTPunkTransportError,
+    UserError,
 )
 
 from ._config import Timeout
@@ -28,6 +36,7 @@ from ._exceptions import (
     RemoteProtocolError,
     RequestError,
     TimeoutException,
+    WriteError,
 )
 from ._headers import Headers
 from ._models import Request, Response
@@ -39,11 +48,11 @@ __all__ = ["PoolTransport"]
 
 _MAX_NACK_RETRIES = 2
 
-# The peer went away with our exchange in flight: the transport failed (hyper's
-# `Io`, both protocols), or on h1 it closed cleanly before the response head
-# (hyper's `IncompleteMessage`, httpunk >= 0.3.0 — a sibling under `H1Error`, not
-# a `ConnectionClosedError`). The same "server disconnected" verdict either way.
-_DISCONNECTED = (ConnectionClosedError, H1IncompleteMessageError)
+# The peer went away with our exchange in flight: the transport failed or ended
+# (hyper's `Io`, both protocols), or on h1 it closed cleanly before the response
+# head (hyper's `IncompleteMessage`). The same "server disconnected" verdict
+# either way.
+_DISCONNECTED = (HTTPunkTransportError, H1IncompleteMessageError)
 
 
 def map_httpunk_exception(exc: BaseException, request: Request) -> BaseException:
@@ -52,17 +61,33 @@ def map_httpunk_exception(exc: BaseException, request: Request) -> BaseException
         if isinstance(exc, RequestError) and exc._request is None:
             exc.request = request
         return exc
-    message = str(exc) or type(exc).__name__
+    if isinstance(exc, (H1BodyError, H1ParseError, H2ProtocolError, UserError)):
+        message = exc.args[1]  # httpunk: args = (kind or reason, message)
+    elif isinstance(exc, H2FlowControlError):
+        message = "HTTP/2 flow control error"  # httpunk: args = (reason,)
+    else:
+        message = str(exc) or type(exc).__name__
     mapped: HTTPError
-    if isinstance(exc, (H1UserError, H2UserError, ValueError)):
+    if isinstance(exc, (UserError, ValueError)):
         # local misuse: hyper's `Kind::User` on h1, the h2 state machine's API
         # errors, and the `http` crate's constructor validation (`ValueError`)
         mapped = LocalProtocolError(message)
-    elif isinstance(exc, _DISCONNECTED):
-        mapped = RemoteProtocolError(f"Server disconnected: {message}")
-    elif isinstance(exc, H2KeepAliveTimeoutError):
+    elif isinstance(exc, H2KeepAliveTimeoutError) or (
+        isinstance(exc, HTTPConnectionError) and exc.errno == errno.ETIMEDOUT
+    ):
+        # the peer stopped answering: httpunk's PING went unanswered, or the
+        # kernel gave up on the connection (TCP keepalive, `TCP_USER_TIMEOUT`).
+        # reqwest's `is_timeout()` is true for both (error.rs:129-131).
         mapped = TimeoutException(message)
-    elif isinstance(exc, (H2Error, HTTPunkError)):
+    elif isinstance(exc, (RequestNotSentError, *_DISCONNECTED)):
+        mapped = RemoteProtocolError(f"Server disconnected: {message}")
+    elif isinstance(exc, (BodyError, ConnectionClosedError)):
+        # a response body that could not be read, or the connection closed
+        # locally under the request
+        mapped = ReadError(message)
+    elif isinstance(exc, BodyWriteError):
+        mapped = WriteError(message)
+    elif isinstance(exc, HTTPunkError):
         mapped = RemoteProtocolError(message)
     elif isinstance(exc, OSError):
         mapped = ReadError(message)
@@ -80,21 +105,21 @@ def _is_retryable_nack(exc: BaseException, reused: bool, replayable: bool) -> bo
         return replayable and exc.error_code == H2Reason.NO_ERROR
     if isinstance(exc, StreamResetError):
         return replayable and exc.error_code == H2Reason.REFUSED_STREAM
-    if getattr(exc, "request_unsent", False):
-        # httpunk >= 0.2.0 (h1): the failure was raised before the request was
-        # handed to the body writer — nothing reached the wire and the body
-        # was never iterated, so even a streamed body is intact and safe to
-        # resend (hyper's `try_send_request` give-back, client/conn/http1.rs:
-        # an error "before trying to serialize the request" returns the
-        # message). The `reused` gate is punkreq's own policy: a give-back on a
+    if isinstance(exc, RequestNotSentError):
+        # the connection could not take the request — nothing reached the wire
+        # and the body was never iterated, so even a streamed body is intact
+        # and safe to resend (hyper's `try_send_request` give-back,
+        # client/conn/http1.rs: an error "before trying to serialize the
+        # request" returns the message). The `reused` gate is punkreq's own
+        # policy: a give-back on a
         # fresh connection means the origin is failing at dial time, and a
         # redial would only fail the same way — only an idle keep-alive
         # connection dying underneath us is a nack worth one more try.
         return reused
     if isinstance(exc, _DISCONNECTED):
-        # h1 keep-alive race past the writer hand-off: the server closed the
-        # connection as we reused it (EOF before the response head, hyper's
-        # `IncompleteMessage`), but body bytes may have been consumed.
+        # keep-alive race past the writer hand-off: the server closed the
+        # connection as we reused it (the transport failing, or on h1 an EOF
+        # before the response head), but body bytes may have been consumed.
         # Only safe when the connection had served traffic before AND the body
         # replays from memory.
         return reused and replayable

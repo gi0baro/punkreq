@@ -1,12 +1,13 @@
 import pytest
 from httpunk import Backend, GoAwayError, H2Reason, StreamResetError
 from httpunk.exceptions import (
-    ConnectionClosedError,
     H1IncompleteMessageError,
     H1ParseError,
     H1UnexpectedMessageError,
     H1UserError,
     H2UserError,
+    RequestNotSentError,
+    TransportError,
 )
 
 from punkreq import LocalProtocolError, RemoteProtocolError, Request, Response
@@ -34,11 +35,6 @@ def make_stream(fake, recorder):
 
 def make_response(fake, recorder):
     return Response(200, stream=make_stream(fake, recorder), request=REQUEST)
-
-
-def unsent(exc):
-    exc.request_unsent = True
-    return exc
 
 
 @pytest.fixture
@@ -144,33 +140,27 @@ async def test_stream_close_is_idempotent():
 # never processed the request, gated on the body still being resendable -----
 
 
-def test_nack_request_unsent_retries_any_body_on_reused():
-    exc = unsent(ConnectionClosedError("connection closed"))
+def test_nack_request_not_sent_retries_any_body_on_reused():
+    exc = RequestNotSentError("request not sent: connection closed")
     assert _is_retryable_nack(exc, reused=True, replayable=False)
     assert _is_retryable_nack(exc, reused=True, replayable=True)
 
 
-def test_nack_request_unsent_fresh_connection_never_retries():
-    exc = unsent(ConnectionClosedError("connection closed"))
+def test_nack_request_not_sent_fresh_connection_never_retries():
+    exc = RequestNotSentError("request not sent: connection closed")
     assert not _is_retryable_nack(exc, reused=False, replayable=True)
-
-
-def test_nack_request_unsent_marker_works_on_any_exception_type():
-    # the idle-bytes poison error carries the marker on a ValueError
-    exc = unsent(ValueError("received 7 unexpected bytes on an idle HTTP/1 connection"))
-    assert _is_retryable_nack(exc, reused=True, replayable=False)
 
 
 @pytest.mark.parametrize(
     "exc",
     [
-        # httpunk >= 0.3.0 h1: EOF before the response head (hyper `IncompleteMessage`)
+        # h1: EOF before the response head (hyper `IncompleteMessage`)
         H1IncompleteMessageError("connection closed before message completed: no response head"),
         # a transport failure with the exchange in flight (hyper `Io`, h1 + h2)
-        ConnectionClosedError("connection closed"),
+        TransportError("connection error: closed by peer"),
     ],
 )
-def test_nack_disconnected_without_marker_needs_replayable(exc):
+def test_nack_disconnected_needs_replayable(exc):
     assert _is_retryable_nack(exc, reused=True, replayable=True)
     assert not _is_retryable_nack(exc, reused=True, replayable=False)
     assert not _is_retryable_nack(exc, reused=False, replayable=True)
@@ -178,8 +168,8 @@ def test_nack_disconnected_without_marker_needs_replayable(exc):
 
 def test_nack_other_h1_errors_never_retry():
     # unexpected bytes past a response poison the connection: a genuine
-    # protocol violation, not a nack (only its `request_unsent` re-raise on
-    # the next send is retried, and that goes through the marker branch)
+    # protocol violation, not a nack (only the `RequestNotSentError` the next
+    # send raises from it is retried)
     assert not _is_retryable_nack(H1UnexpectedMessageError("7 bytes"), reused=True, replayable=True)
     assert not _is_retryable_nack(H1ParseError("Version", "invalid HTTP version"), reused=True, replayable=True)
 
@@ -211,7 +201,8 @@ def test_map_local_misuse_is_local():
 def test_map_disconnect_is_remote_server_disconnected():
     for exc in (
         H1IncompleteMessageError("connection closed before message completed: no response head"),
-        ConnectionClosedError("connection closed"),
+        TransportError("connection error: closed by peer"),
+        RequestNotSentError("request not sent: connection closed"),
     ):
         mapped = map_httpunk_exception(exc, REQUEST)
         assert isinstance(mapped, RemoteProtocolError), exc
@@ -234,11 +225,11 @@ def test_map_os_error_is_read_error():
 
 
 @pytest.mark.asyncio
-async def test_retry_streamed_body_when_request_unsent(make_transport):
+async def test_retry_streamed_body_when_request_not_sent(make_transport):
     conns, pool, transport = make_transport()
     async with pool:
         await park_connection(transport)
-        conns[0].fail_next = unsent(ConnectionClosedError("connection closed"))
+        conns[0].fail_next = RequestNotSentError("request not sent: connection closed")
         response = await transport.send(streamed_request("http://example.com/upload"))
         assert response.status_code == 200
         assert await response.read() == b"ok"
@@ -249,7 +240,7 @@ async def test_retry_streamed_body_when_request_unsent(make_transport):
 
 
 @pytest.mark.asyncio
-async def test_no_retry_streamed_body_without_marker(make_transport):
+async def test_no_retry_streamed_body_after_disconnect(make_transport):
     conns, pool, transport = make_transport()
     async with pool:
         await park_connection(transport)
@@ -260,7 +251,7 @@ async def test_no_retry_streamed_body_without_marker(make_transport):
 
 
 @pytest.mark.asyncio
-async def test_retry_replayable_body_without_marker(make_transport):
+async def test_retry_replayable_body_after_disconnect(make_transport):
     conns, pool, transport = make_transport()
     async with pool:
         await park_connection(transport)
@@ -272,13 +263,13 @@ async def test_retry_replayable_body_without_marker(make_transport):
 
 
 @pytest.mark.asyncio
-async def test_no_retry_request_unsent_on_fresh_connection(make_transport):
+async def test_no_retry_request_not_sent_on_fresh_connection(make_transport):
     conns, pool, transport = make_transport()
     async with pool:
         # no warm-up: the first acquire dials fresh (reused=False)
         async def connector_fail(origin):
             conn = FakeConnection()
-            conn.fail_next = unsent(ConnectionClosedError("connection closed"))
+            conn.fail_next = RequestNotSentError("request not sent: connection closed")
             conns.append(conn)
             return conn
 

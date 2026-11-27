@@ -10,7 +10,7 @@ from httpunk.h2.client import H2Connection
 from httpunk.util.proxy import Matcher
 
 from ._config import Proxy
-from ._connect import Connector, Origin, connect_errors
+from ._connect import Connector, Origin
 from ._exceptions import ConnectError, ProxyError
 from ._headers import Headers
 from ._urls import URL
@@ -95,7 +95,9 @@ class ProxyConnector:
             if origin.scheme == "http":
                 return await self._absolute_form(origin, intercept)
             return await self._tunnel(origin, intercept)
-        except connect_errors(self._backend) as exc:
+        except ProxyError:
+            raise
+        except Exception as exc:
             raise ConnectError(f"Failed to connect to {origin} via proxy {intercept.uri}: {exc}")
 
     async def _dial_proxy(self, intercept: typing.Any) -> typing.Any:
