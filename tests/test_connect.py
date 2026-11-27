@@ -22,6 +22,9 @@ class RecordingBackend:
         self.calls.append((alpn, ssl_context))
         return object(), self.selected
 
+    def get_socket(self, stream):
+        return None
+
     def __getattr__(self, name):
         return getattr(self._inner, name)
 

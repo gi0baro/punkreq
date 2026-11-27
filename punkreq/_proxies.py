@@ -67,6 +67,7 @@ class ProxyConnector:
         http1: bool = True,
         http2: bool = True,
         h2_options: dict[str, typing.Any] = {},
+        tcp_options: dict[str, typing.Any] = {},
         config: ProxyConfig,
     ) -> None:
         self._backend = backend
@@ -78,7 +79,12 @@ class ProxyConnector:
         # the direct connector configures the ALPN offer on `ssl_context` at
         # construction; `wrap_tls` (the CONNECT tunnel) takes it from the context
         self._direct = Connector(
-            backend=backend, ssl_context=ssl_context, http1=http1, http2=http2, h2_options=h2_options
+            backend=backend,
+            ssl_context=ssl_context,
+            http1=http1,
+            http2=http2,
+            h2_options=h2_options,
+            **tcp_options,
         )
 
     async def __call__(self, origin: Origin) -> typing.Any:
@@ -100,8 +106,10 @@ class ProxyConnector:
             stream, _ = await self._backend.connect_tls(
                 host, port, alpn=("http/1.1",), ssl_context=self._config.ssl_context
             )
-            return stream
-        return await self._backend.connect_tcp(host, port)
+        else:
+            stream = await self._backend.connect_tcp(host, port)
+        self._direct._set_socket_options(stream)
+        return stream
 
     def _proxy_headers(self, intercept: typing.Any, authority: str) -> httpunk.HeaderMap:
         headers = httpunk.HeaderMap({"host": authority})

@@ -90,7 +90,8 @@ client = Client(
 ```
 
 By default: redirects on (max 10), no timeouts, no cookie jar unless requested, 
-HTTP/2 enabled, 90s keep-alive expiry, unlimited connections.
+HTTP/2 enabled, 90s keep-alive expiry, unlimited connections, TCP keepalive
+(15s idle, 15s interval, 3 probes) and, on Linux, a 30s TCP user timeout.
 
 `Timeout` has four independent fields — `total` (a deadline for the whole
 request, redirects included), `connect`, `read` and `pool`. There is no write

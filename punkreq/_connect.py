@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import os
+import socket
 import ssl
+import sys
 import typing
 
 from httpunk.exceptions import HTTPunkError
@@ -14,6 +17,8 @@ from ._exceptions import ConnectError, UnsupportedProtocol
 __all__ = ["Connector", "Origin", "connect_errors", "create_ssl_context", "origin_for_url"]
 
 DEFAULT_PORTS = {"http": 80, "https": 443}
+
+_TCP_KEEPIDLE = socket.TCP_KEEPALIVE if sys.platform == "darwin" else socket.TCP_KEEPIDLE
 
 CertTypes = typing.Union[
     str,
@@ -106,6 +111,10 @@ class Connector:
         http1: bool = True,
         http2: bool = True,
         h2_options: dict[str, typing.Any] = {},
+        tcp_keepalive: float | None = None,
+        tcp_keepalive_interval: float | None = None,
+        tcp_keepalive_retries: int | None = None,
+        tcp_user_timeout: float | None = None,
     ) -> None:
         if not http1 and not http2:
             raise ValueError("At least one of http1/http2 must be enabled")
@@ -114,6 +123,22 @@ class Connector:
         self._http1 = http1
         self._http2 = http2
         self._h2_options = h2_options
+        # The `setsockopt` calls for each dialed socket, as hyper-util's
+        # `HttpConnector` makes them (client/legacy/connect/http.rs): keepalive
+        # is on when any of its three settings is, and its durations are whole
+        # seconds (truncated, as socket2 does).
+        options = []
+        if tcp_keepalive is not None or tcp_keepalive_interval is not None or tcp_keepalive_retries is not None:
+            options.append((socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1))
+        if tcp_keepalive is not None:
+            options.append((socket.IPPROTO_TCP, _TCP_KEEPIDLE, int(tcp_keepalive)))
+        if tcp_keepalive_interval is not None:
+            options.append((socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, int(tcp_keepalive_interval)))
+        if tcp_keepalive_retries is not None:
+            options.append((socket.IPPROTO_TCP, socket.TCP_KEEPCNT, tcp_keepalive_retries))
+        if sys.platform == "linux" and tcp_user_timeout is not None:
+            options.append((socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, int(tcp_user_timeout * 1000)))
+        self._socket_options = options
         if http1 and http2:
             self.alpn: tuple[str, ...] = ("h2", "http/1.1")
         elif http2:
@@ -139,6 +164,17 @@ class Connector:
         except connect_errors(self._backend) as exc:
             raise ConnectError(f"Failed to connect to {origin}: {exc}")
 
+    def _set_socket_options(self, stream):
+        """hyper-util sets the options before connecting; the backend dials and
+        handshakes in one call, so here they go on the connected socket. A
+        failure is ignored, as there."""
+        sock = self._backend.get_socket(stream)
+        if sock is None:
+            return
+        with contextlib.suppress(OSError):
+            for option in self._socket_options:
+                sock.setsockopt(*option)
+
     async def _connect_tls(self, origin: Origin) -> H1Connection | H2Connection:
         # our context already carries the offer; a backend-created default one
         # (no context given) is configured per dial
@@ -146,6 +182,7 @@ class Connector:
         stream, selected = await self._backend.connect_tls(
             origin.host, origin.port, alpn=alpn, ssl_context=self._ssl_context
         )
+        self._set_socket_options(stream)
         if selected == "h2" or not self._http1:
             return H2Connection(
                 stream, authority=origin.authority, scheme="https", backend=self._backend, **self._h2_options
@@ -154,6 +191,7 @@ class Connector:
 
     async def _connect_tcp(self, origin: Origin) -> H1Connection | H2Connection:
         stream = await self._backend.connect_tcp(origin.host, origin.port)
+        self._set_socket_options(stream)
         if not self._http1:
             # h2 prior knowledge over cleartext (reqwest's http2_prior_knowledge)
             return H2Connection(

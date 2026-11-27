@@ -88,11 +88,15 @@ class BaseClient:
         trust_env: bool = True,
         http1: bool = True,
         http2: bool = True,
+        limits: Limits = DEFAULT_LIMITS,
+        default_encoding: str | typing.Callable[[bytes], str | None] = "utf-8",
         http2_keep_alive_interval: float | None = None,
         http2_keep_alive_timeout: float = 20.0,
         http2_keep_alive_while_idle: bool = False,
-        limits: Limits = DEFAULT_LIMITS,
-        default_encoding: str | typing.Callable[[bytes], str | None] = "utf-8",
+        tcp_keepalive: float | None = 15.0,
+        tcp_keepalive_interval: float | None = 15.0,
+        tcp_keepalive_retries: int | None = 3,
+        tcp_user_timeout: float | None = 30.0,
         connector: typing.Callable[..., typing.Awaitable[typing.Any]] | None = None,
     ) -> None:
         if self._backend_type is None:
@@ -117,6 +121,12 @@ class BaseClient:
                 "keep_alive_timeout": http2_keep_alive_timeout,
                 "keep_alive_while_idle": http2_keep_alive_while_idle,
             }
+            tcp_options = {
+                "tcp_keepalive": tcp_keepalive,
+                "tcp_keepalive_interval": tcp_keepalive_interval,
+                "tcp_keepalive_retries": tcp_keepalive_retries,
+                "tcp_user_timeout": tcp_user_timeout,
+            }
             if proxy_config is not None:
                 connector = ProxyConnector(
                     backend=self._backend,
@@ -124,11 +134,17 @@ class BaseClient:
                     http1=http1,
                     http2=http2,
                     h2_options=h2_options,
+                    tcp_options=tcp_options,
                     config=proxy_config,
                 )
             else:
                 connector = Connector(
-                    backend=self._backend, ssl_context=ssl_context, http1=http1, http2=http2, h2_options=h2_options
+                    backend=self._backend,
+                    ssl_context=ssl_context,
+                    http1=http1,
+                    http2=http2,
+                    h2_options=h2_options,
+                    **tcp_options,
                 )
         self._pool = ConnectionPool(connector, backend=self._backend, limits=limits)
         self._transport = PoolTransport(self._pool, backend=self._backend)
