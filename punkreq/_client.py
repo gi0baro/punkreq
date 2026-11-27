@@ -88,6 +88,9 @@ class BaseClient:
         trust_env: bool = True,
         http1: bool = True,
         http2: bool = True,
+        http2_keep_alive_interval: float | None = None,
+        http2_keep_alive_timeout: float = 20.0,
+        http2_keep_alive_while_idle: bool = False,
         limits: Limits = DEFAULT_LIMITS,
         default_encoding: str | typing.Callable[[bytes], str | None] = "utf-8",
         connector: typing.Callable[..., typing.Awaitable[typing.Any]] | None = None,
@@ -109,12 +112,24 @@ class BaseClient:
         if connector is None:
             ssl_context = create_ssl_context(verify, cert)
             proxy_config = ProxyConfig.resolve(proxy, trust_env)
+            h2_options = {
+                "keep_alive_interval": http2_keep_alive_interval,
+                "keep_alive_timeout": http2_keep_alive_timeout,
+                "keep_alive_while_idle": http2_keep_alive_while_idle,
+            }
             if proxy_config is not None:
                 connector = ProxyConnector(
-                    backend=self._backend, ssl_context=ssl_context, http1=http1, http2=http2, config=proxy_config
+                    backend=self._backend,
+                    ssl_context=ssl_context,
+                    http1=http1,
+                    http2=http2,
+                    h2_options=h2_options,
+                    config=proxy_config,
                 )
             else:
-                connector = Connector(backend=self._backend, ssl_context=ssl_context, http1=http1, http2=http2)
+                connector = Connector(
+                    backend=self._backend, ssl_context=ssl_context, http1=http1, http2=http2, h2_options=h2_options
+                )
         self._pool = ConnectionPool(connector, backend=self._backend, limits=limits)
         self._transport = PoolTransport(self._pool, backend=self._backend)
 

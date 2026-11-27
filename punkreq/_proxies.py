@@ -66,16 +66,20 @@ class ProxyConnector:
         ssl_context: ssl.SSLContext,
         http1: bool = True,
         http2: bool = True,
+        h2_options: dict[str, typing.Any] = {},
         config: ProxyConfig,
     ) -> None:
         self._backend = backend
         self._ssl_context = ssl_context
         self._http1 = http1
         self._http2 = http2
+        self._h2_options = h2_options
         self._config = config
         # the direct connector configures the ALPN offer on `ssl_context` at
         # construction; `wrap_tls` (the CONNECT tunnel) takes it from the context
-        self._direct = Connector(backend=backend, ssl_context=ssl_context, http1=http1, http2=http2)
+        self._direct = Connector(
+            backend=backend, ssl_context=ssl_context, http1=http1, http2=http2, h2_options=h2_options
+        )
 
     async def __call__(self, origin: Origin) -> typing.Any:
         intercept = self._config.matcher.intercept(f"{origin.scheme}://{origin.authority}/")
@@ -150,7 +154,9 @@ class ProxyConnector:
             raise ProxyError(f"Cannot open a TLS tunnel to {origin} via proxy {intercept.uri}: {exc}")
 
         if selected == "h2" or not self._http1:
-            conn = H2Connection(tls, authority=origin.authority, scheme="https", backend=self._backend)
+            conn = H2Connection(
+                tls, authority=origin.authority, scheme="https", backend=self._backend, **self._h2_options
+            )
         else:
             conn = H1Connection(tls, authority=origin.authority, backend=self._backend)
         await conn.__aenter__()

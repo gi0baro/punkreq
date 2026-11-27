@@ -12,6 +12,7 @@ from httpunk.exceptions import (
     H1IncompleteMessageError,
     H1UserError,
     H2Error,
+    H2KeepAliveTimeoutError,
     H2UserError,
     HTTPunkError,
 )
@@ -59,6 +60,8 @@ def map_httpunk_exception(exc: BaseException, request: Request) -> BaseException
         mapped = LocalProtocolError(message)
     elif isinstance(exc, _DISCONNECTED):
         mapped = RemoteProtocolError(f"Server disconnected: {message}")
+    elif isinstance(exc, H2KeepAliveTimeoutError):
+        mapped = TimeoutException(message)
     elif isinstance(exc, (H2Error, HTTPunkError)):
         mapped = RemoteProtocolError(message)
     elif isinstance(exc, OSError):

@@ -105,6 +105,7 @@ class Connector:
         ssl_context: ssl.SSLContext | None = None,
         http1: bool = True,
         http2: bool = True,
+        h2_options: dict[str, typing.Any] = {},
     ) -> None:
         if not http1 and not http2:
             raise ValueError("At least one of http1/http2 must be enabled")
@@ -112,6 +113,7 @@ class Connector:
         self._ssl_context = ssl_context
         self._http1 = http1
         self._http2 = http2
+        self._h2_options = h2_options
         if http1 and http2:
             self.alpn: tuple[str, ...] = ("h2", "http/1.1")
         elif http2:
@@ -145,12 +147,16 @@ class Connector:
             origin.host, origin.port, alpn=alpn, ssl_context=self._ssl_context
         )
         if selected == "h2" or not self._http1:
-            return H2Connection(stream, authority=origin.authority, scheme="https", backend=self._backend)
+            return H2Connection(
+                stream, authority=origin.authority, scheme="https", backend=self._backend, **self._h2_options
+            )
         return H1Connection(stream, authority=origin.authority, backend=self._backend)
 
     async def _connect_tcp(self, origin: Origin) -> H1Connection | H2Connection:
         stream = await self._backend.connect_tcp(origin.host, origin.port)
         if not self._http1:
             # h2 prior knowledge over cleartext (reqwest's http2_prior_knowledge)
-            return H2Connection(stream, authority=origin.authority, scheme="http", backend=self._backend)
+            return H2Connection(
+                stream, authority=origin.authority, scheme="http", backend=self._backend, **self._h2_options
+            )
         return H1Connection(stream, authority=origin.authority, backend=self._backend)
